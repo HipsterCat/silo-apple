@@ -31,11 +31,30 @@ final class DescriptionTranslationCoordinator {
     /// Re-poll schedule (seconds). The overview typically lands within the
     /// first couple of passes; the tail covers a slow translation. The sum
     /// is the hard cap (~31s) after which we give up and surface `.failed`.
-    private let backoff: [TimeInterval] = [1, 2, 3, 5, 5, 5, 5, 5]
+    private let backoff: [TimeInterval]
+    private let authorityCheck: ((CapturedOrdinaryRequestAuth) async -> Bool)?
+    private let detailRead: ((String) async throws -> ItemDetail)?
+    var runTaskForTesting: Task<Void, Never>? { task }
 
-    init(api: SiloAI = .shared, catalog: SiloAPI = .shared) {
+    init(api: SiloAI = .shared, catalog: SiloAPI = .shared,
+         backoff: [TimeInterval] = [1, 2, 3, 5, 5, 5, 5, 5],
+         authorityCheck: ((CapturedOrdinaryRequestAuth) async -> Bool)? = nil,
+         detailRead: ((String) async throws -> ItemDetail)? = nil) {
         self.api = api
         self.catalog = catalog
+        self.backoff = backoff
+        self.authorityCheck = authorityCheck
+        self.detailRead = detailRead
+    }
+
+    private func matchesAuthority(_ auth: CapturedOrdinaryRequestAuth) async -> Bool {
+        if let authorityCheck { return await authorityCheck(auth) }
+        return await api.matchesAuthority(auth)
+    }
+
+    private func readDetail(_ id: String) async throws -> ItemDetail {
+        if let detailRead { return try await detailRead(id) }
+        return try await catalog.itemDetail(contentId: id)
     }
 
     /// Kick off a translation for `contentId` into `targetLanguage`,
@@ -77,8 +96,13 @@ final class DescriptionTranslationCoordinator {
             }
         }
 
+        let auth: CapturedOrdinaryRequestAuth
         do {
-            try await api.translateDescription(contentId: contentId, targetLanguage: targetLanguage)
+            auth = try await api.captureCreationAuthority()
+            guard isCurrentRun(runID) else { return }
+            let job = try await api.translateDescription(contentId: contentId, targetLanguage: targetLanguage, auth: auth)
+            guard isCurrentRun(runID) else { return }
+            if job.failed { phase = .failed; return }
         } catch {
             guard isCurrentRun(runID) else { return }
             phase = .failed
@@ -90,13 +114,19 @@ final class DescriptionTranslationCoordinator {
             try? await Task.sleep(for: .seconds(delay))
             guard isCurrentRun(runID) else { return }
 
-            guard let refreshed = try? await catalog.itemDetail(contentId: contentId) else {
+            let mayRead = await matchesAuthority(auth)
+            guard isCurrentRun(runID) else { return }
+            guard mayRead else { phase = .failed; return }
+            guard let refreshed = try? await readDetail(contentId) else {
                 continue
             }
             // A cancellation (disappear / item change) may have landed during
             // the fetch above; bail before applying so a stale poll can't
             // clobber the view model / cache with the previous item's detail.
             guard isCurrentRun(runID) else { return }
+            let mayPublish = await matchesAuthority(auth)
+            guard isCurrentRun(runID) else { return }
+            guard mayPublish else { phase = .failed; return }
             apply(refreshed)
             ResponseCache.shared.set(refreshed, for: CacheKey.itemDetail(contentId))
 

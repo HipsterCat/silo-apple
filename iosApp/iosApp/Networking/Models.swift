@@ -27,7 +27,7 @@ struct BrowseItem: Codable, Identifiable, Hashable {
     let addedAt: String?
     let releaseDate: String?
     let lastAirDate: String?
-    let userState: MediaItemUserState?
+    var userState: MediaItemUserState?
     let overlaySummary: OverlaySummary?
     var id: String { contentId }
 
@@ -135,6 +135,26 @@ struct CatalogResponse: Codable {
     let source: String?
     let title: String?
     let snapshot: String?
+
+    init(catalogPage: APIv2CatalogPage) {
+        total = catalogPage.total
+        totalExact = catalogPage.totalExact
+        hasMore = catalogPage.page.hasMore
+        items = catalogPage.items
+        source = nil
+        title = nil
+        snapshot = nil
+    }
+
+    init(collectionCards: [BrowseItem]) {
+        total = collectionCards.count
+        totalExact = true
+        hasMore = false
+        items = collectionCards
+        source = "user_collection"
+        title = nil
+        snapshot = nil
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -359,6 +379,9 @@ struct ResolvedSection: Codable, Identifiable {
 
 struct SectionsResponse: Codable {
     let sections: [ResolvedSection]
+    /// Process-memory provenance only; never serialized into wire/cache documents.
+    var homeReadAuth: CapturedOrdinaryRequestAuth? = nil
+    private enum CodingKeys: String, CodingKey { case sections }
 
     init(sections: [ResolvedSection]) {
         self.sections = Self.strippingUnsupportedItems(sections)
@@ -1546,4 +1569,28 @@ struct SetSettingBody: Codable {
 struct OverlayConfigResponse: Codable {
     let enabled: Bool
     let defaults: String?
+}
+
+/// The validator belongs to the canonical read and its captured viewer, never a list row.
+struct CollectionEditVersion: Sendable {
+    let path: String
+    let etag: String
+    let identity: HTTPRequestIdentity
+    let account: RefreshAccountIdentity
+}
+struct CollectionEditor<Value> {
+    let value: Value
+    let version: CollectionEditVersion
+}
+struct PersonalCollectionsV2: Decodable {
+    let items: [UserCollection]
+    let groups: [CollectionGroup]
+}
+struct CollectionCapabilitiesV2: Decodable {
+    let groups: Bool
+}
+
+struct CollectionCardsV2: Decodable {
+    let items: [BrowseItem]
+    let page: APIv2Page
 }

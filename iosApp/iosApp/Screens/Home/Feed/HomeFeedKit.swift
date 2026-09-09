@@ -182,7 +182,12 @@ private struct HomeCardMenu: ViewModifier {
     /// `MediaCard` drives its badge from the same effective state.
     @Binding var playedOverride: Bool?
     @State private var favoriteOverride: Bool?
+    @Environment(\.homePersonalListAuth) private var personalListAuth
+    @State private var favoriteRun: UUID?
+    @State private var favoritePending = false
     @State private var watchlistOverride: Bool?
+    @State private var watchlistRun: UUID?
+    @State private var watchlistPending = false
 
     private var isPlayed: Bool { playedOverride ?? (item.userState?.played == true) }
     private var isFavorite: Bool { favoriteOverride ?? (item.userState?.isFavorite == true) }
@@ -200,7 +205,10 @@ private struct HomeCardMenu: ViewModifier {
         if hasAnyAction {
             content
                 .contextMenu { menuItems }
+                .onChange(of: item.contentId) { _, _ in resetPersonalActions() }
+                .onChange(of: personalListAuth) { _, _ in resetPersonalActions() }
                 .onChange(of: item.userState) { _, _ in
+                    resetPersonalActions()
                     playedOverride = nil
                     favoriteOverride = nil
                     watchlistOverride = nil
@@ -245,31 +253,59 @@ private struct HomeCardMenu: ViewModifier {
         }
     }
 
+    private func resetPersonalActions() {
+        favoriteRun = nil
+        favoriteOverride = nil
+        watchlistRun = nil
+        watchlistOverride = nil
+    }
+
     private func toggleFavorite() {
+        guard !favoritePending, let auth = personalListAuth else { return }
+        let contentId = item.contentId
+        let oldOverride = favoriteOverride
         let newValue = !isFavorite
-        let watchlist = inWatchlist
+        let run = UUID()
+        favoriteRun = run
+        favoritePending = true
         favoriteOverride = newValue
-        Task {
-            if await PersonalListSync.setFavorite(
-                contentId: item.contentId, isFavorite: newValue, inWatchlist: watchlist
-            ) == false {
-                favoriteOverride = !newValue
-            }
+        Task { @MainActor in
+            defer { favoritePending = false }
+            let success = await PersonalListSync.setHomeFavorite(
+                contentId: contentId, isFavorite: newValue, auth: auth
+            )
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard favoriteRun == run, item.contentId == contentId, personalListAuth == auth,
+                  !Task.isCancelled else { return }
+            favoriteRun = nil
+            guard current else { favoriteOverride = nil; return }
+            if !success { favoriteOverride = oldOverride }
         }
     }
 
     private func toggleWatchlist() {
+        guard !watchlistPending, let auth = personalListAuth else { return }
+        let contentId = item.contentId
+        let oldOverride = watchlistOverride
         let newValue = !inWatchlist
-        let favorite = isFavorite
+        let run = UUID()
+        watchlistRun = run
+        watchlistPending = true
         watchlistOverride = newValue
-        Task {
-            if await PersonalListSync.setWatchlist(
-                contentId: item.contentId, isFavorite: favorite, inWatchlist: newValue
-            ) == false {
-                watchlistOverride = !newValue
-            }
+        Task { @MainActor in
+            defer { watchlistPending = false }
+            let success = await PersonalListSync.setHomeWatchlist(
+                contentId: contentId, inWatchlist: newValue, auth: auth
+            )
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard watchlistRun == run, item.contentId == contentId, personalListAuth == auth,
+                  !Task.isCancelled else { return }
+            watchlistRun = nil
+            guard current else { watchlistOverride = nil; return }
+            if !success { watchlistOverride = oldOverride }
         }
     }
+
 }
 
 // MARK: - Watched check

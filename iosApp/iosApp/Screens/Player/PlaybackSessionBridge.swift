@@ -80,6 +80,10 @@ struct PreparedPlayback {
     }
 }
 
+enum PlaybackSessionStopResolution: Equatable, Sendable {
+    case noSession, closed, pending, ownerLost
+}
+
 enum PlaybackProgressReportResult: Equatable {
     case success
     case missingSession
@@ -376,6 +380,18 @@ actor PlaybackSessionBridge {
         category: "Playback"
     )
 
+    private var retiringSession: Task<PlaybackSessionStopResolution, Never>?
+    private let mutationCoordinator: PlaybackMutationCoordinator
+    private let api: SiloAPI
+    private let tokens: TokenStore
+
+    init(mutationCoordinator: PlaybackMutationCoordinator = .shared, api: SiloAPI = .shared, tokens: TokenStore = .shared) {
+        self.mutationCoordinator = mutationCoordinator
+        self.api = api
+        self.tokens = tokens
+    }
+    private var sequencedSessionIDs: Set<String> = []
+    private var failedSequencedRegistrations: Set<String> = []
     private var sessionId: String?
     private var currentSession: PlaybackSessionResponse?
 
@@ -502,6 +518,21 @@ actor PlaybackSessionBridge {
         }
     }
 
+    private func registerSequencedAllocation(_ response: PlaybackV3DecisionResponse,
+                                             auth: CapturedDurableAccountAuth?) async throws {
+        guard let id = Self.allocatedSessionId(in: response) else { return }
+        if await mutationCoordinator.usesV2(id) { sequencedSessionIDs.insert(id); return }
+        guard response.serverFeatures.contains(PlaybackSequencedContract.feature) else { return }
+        sequencedSessionIDs.insert(id)
+        do {
+            guard let auth else { throw PlaybackSequencedError.authorityChanged }
+            try await mutationCoordinator.register(sessionID: id, features: response.serverFeatures, auth: auth)
+        } catch {
+            failedSequencedRegistrations.insert(id)
+            throw error
+        }
+    }
+
     /// Retires a server session this client allocated but will never execute.
     ///
     /// Recovery is impossible here — the server reclaims idle sessions on its
@@ -513,6 +544,11 @@ actor PlaybackSessionBridge {
         reason: String
     ) async {
         do {
+            if sequencedSessionIDs.contains(abandonedSessionId) {
+                guard !failedSequencedRegistrations.contains(abandonedSessionId) else { throw PlaybackSequencedError.authorityChanged }
+                _ = try await mutationCoordinator.stop(sessionID: abandonedSessionId, position: nil, isPaused: true)
+                return
+            }
             try await SiloAPI.shared.stopPlayback(sessionId: abandonedSessionId)
         } catch {
             logger.error(
@@ -670,6 +706,7 @@ actor PlaybackSessionBridge {
     }
 
     private func adoptSession(_ session: PlaybackSessionResponse) {
+        retiringSession = nil
         sessionId = session.sessionId
         currentSession = session
         consecutiveProgressFailures = 0
@@ -712,7 +749,7 @@ actor PlaybackSessionBridge {
         preferredQualityOverride: String? = nil
     ) async throws -> PreparedPlayback {
         logger.info("Fetching watch detail for \(contentId, privacy: .public)")
-        let watchDetail = try await SiloAPI.shared.watchDetail(contentId: contentId)
+        let watchDetail = try await api.watchDetail(contentId: contentId)
         logger.info("Got \(watchDetail.versions.count) versions, type=\(watchDetail.type, privacy: .public)")
 
         guard !watchDetail.versions.isEmpty else {
@@ -828,7 +865,7 @@ actor PlaybackSessionBridge {
                     || (prefersLastUsedVersion
                         && selectedVersion.fileId == watchDetail.userData?.lastFileId)
             )
-        let profileId = await TokenStore.shared.getProfileId()
+        let profileId = await tokens.getProfileId()
         guard let profileId,
               !profileId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PlaybackV3TerminalFailure(
@@ -974,6 +1011,19 @@ actor PlaybackSessionBridge {
         }
     }
 
+    /// Retry only the exact attempt inside the cancellation shield. The
+    /// coordinator retains its original ephemeral authority across uncertainty.
+    static func startV2WithNetworkRetry(coordinator: PlaybackMutationCoordinator,
+        request: PlaybackV3StartRequest, auth: CapturedDurableAccountAuth?,
+        capability: APIv2PlaybackCapabilities) async throws -> PlaybackV3DecisionResponse {
+        do {
+            return try await coordinator.startV2(request: request, auth: auth, capability: capability)
+        } catch let error as HTTPError {
+            guard case .network = error else { throw error }
+            return try await coordinator.startV2(request: request, auth: auth, capability: capability)
+        }
+    }
+
     private func stageProtocolV3Start(
         watchDetail: WatchDetail,
         selectedVersion: FileVersion,
@@ -984,10 +1034,11 @@ actor PlaybackSessionBridge {
         audioTrackIndex: Int?,
         subtitleCombinedIndex: Int?
     ) async throws -> StagedProtocolV3Start {
-        let capability = try await PlaybackV3CapabilityGate.shared.requireNeutralProtocolV3()
-        // Optional opt-in: on a server that never advertises it the token is
-        // simply absent and the attempt stays entirely on the API origin.
-        let requestsAuthorizedMediaOrigins = capability.authorizedMediaOrigins
+        let startAuth = try await mutationCoordinator.captureStartAuth()
+        let capturedPlaybackAuth = startAuth.durable
+        let initialCapability = startAuth.capability
+        let requestsAuthorizedMediaOrigins = initialCapability.features.contains(
+            PlaybackProtocolV3.authorizedMediaOriginsFeature)
 
         let snapshot = ApplePlaybackV3Capabilities.snapshot()
         cmpLog("[CMP-OUTPUT] phase=start \(snapshot.outputDiagnosticsLogFields)")
@@ -1028,30 +1079,18 @@ actor PlaybackSessionBridge {
         // timeout. Shield the request from cancellation and retire whatever it
         // allocated if the caller has already walked away.
         let response = try await PlaybackCancellationShield.run {
-            do {
-                return try await SiloAPI.shared.startPlaybackV3(request: request)
-            } catch let error as HTTPError {
-                guard case .network = error else { throw error }
-                // Reuse the exact request and playback_attempt_id so an
-                // ambiguous first response cannot allocate a second logical
-                // attempt. Retried inside the shield so the reclaim path below
-                // sees the final outcome, not the ambiguous one.
-                return try await SiloAPI.shared.startPlaybackV3(request: request)
-            }
+            try await Self.startV2WithNetworkRetry(coordinator: self.mutationCoordinator,
+                request: request, auth: capturedPlaybackAuth, capability: initialCapability)
         } reclaim: { [self] abandoned in
             guard let orphaned = Self.allocatedSessionId(in: abandoned) else { return }
+            try? await registerSequencedAllocation(abandoned, auth: capturedPlaybackAuth)
             await retireAbandonedSession(orphaned, reason: "cancelled_start")
         }
 
+        try await registerSequencedAllocation(response, auth: capturedPlaybackAuth)
+
         switch response.validatedForApple() {
         case .terminal(let terminal):
-            Task {
-                await Self.reportTerminalStart(
-                    playbackAttemptId: playbackAttemptId,
-                    snapshot: snapshot,
-                    terminal: terminal
-                )
-            }
             throw PlaybackV3TerminalFailure(
                 reason: terminal.reason,
                 message: terminal.message,
@@ -1314,6 +1353,47 @@ actor PlaybackSessionBridge {
         }
     }
 
+    static func isV2SameRouteRecovery(operation: String, usesV2: Bool) -> Bool {
+        usesV2 && [PlaybackProtocolV3.ReplanOperation.failureRecovery,
+                   PlaybackProtocolV3.ReplanOperation.seekFailureRecovery,
+                   PlaybackProtocolV3.ReplanOperation.seekReanchor].contains(operation)
+    }
+
+    /// Returns whether a validated replan retains the current route attempt.
+    static func replanPreservesAttempt(operation: String, usesV2: Bool,
+        currentSessionID: String, nextSessionID: String,
+        current: PlaybackV3Plan, next: PlaybackV3Plan,
+        attemptedKeys: [String], responseFeatures: [String]) throws -> Bool {
+        let isSeekReanchor = operation == PlaybackProtocolV3.ReplanOperation.seekReanchor
+        let v2SameRoute = isV2SameRouteRecovery(operation: operation, usesV2: usesV2)
+        let preservesRoute = isSeekReanchor || v2SameRoute
+        guard preservesRoute || !attemptedKeys.contains(next.planAttemptKey) else {
+            throw PlaybackV3TerminalFailure(reason: "replan_loop_detected",
+                message: "The server returned a protocol V3 plan that already failed on this output route.", retryable: false)
+        }
+        if preservesRoute {
+            guard currentSessionID == nextSessionID,
+                  (v2SameRoute || responseFeatures.contains(PlaybackProtocolV3.seekReanchorFeature)),
+                  (!v2SameRoute || (next.planId == current.planId
+                    && next.effectiveMediaFileId == current.effectiveMediaFileId
+                    && next.requestedMediaFileId == current.requestedMediaFileId
+                    && next.source == current.source
+                    && next.stream.protocol == current.stream.protocol
+                    && next.stream.container == current.stream.container)),
+                  next.planAttemptKey == current.planAttemptKey,
+                  next.delivery == current.delivery,
+                  next.effectiveRecipe == current.effectiveRecipe,
+                  next.selectedTracks == current.selectedTracks,
+                  next.transformations == current.transformations,
+                  next.appliedQuirks == current.appliedQuirks,
+                  next.runtimeCorrections == current.runtimeCorrections else {
+                throw PlaybackV3TerminalFailure(reason: "invalid_seek_reanchor_response",
+                    message: "The server changed the route or playback intent during a V3 seek re-anchor.", retryable: false)
+            }
+        }
+        return preservesRoute
+    }
+
     func replanProtocolV3(
         watchDetail: WatchDetail,
         position: Double,
@@ -1360,17 +1440,19 @@ actor PlaybackSessionBridge {
             || operation == PlaybackProtocolV3.ReplanOperation.outputChange
         let invalidatesIntent = isIntent || classification == "output_route_changed"
         let isSeekReanchor = operation == PlaybackProtocolV3.ReplanOperation.seekReanchor
+        let usesV2 = await mutationCoordinator.usesV2(currentSessionId)
+        let preservesRoute = isSeekReanchor || Self.isV2SameRouteRecovery(operation: operation, usesV2: usesV2)
         if isSeekReanchor,
            !active.serverFeatures.contains(PlaybackProtocolV3.seekReanchorFeature) {
             return nil
         }
-        let attemptedKeys = isSeekReanchor
+        let attemptedKeys = preservesRoute
             ? active.attemptedPlanKeys
             : invalidatesIntent
             ? []
             : Array(Set(active.attemptedPlanKeys + [active.planAttemptKey])).sorted()
         let selectedFileId = active.plan.effectiveMediaFileId
-        let selectedAudio = (isSeekReanchor ? nil : audioTrackIndex).flatMap { index in
+        let selectedAudio = (preservesRoute ? nil : audioTrackIndex).flatMap { index in
             guard index >= 0 else { return nil }
             return PlaybackV3TrackIdentity(
                 id: protocolV3TrackId(fileId: selectedFileId, kind: "audio", index: index),
@@ -1378,7 +1460,7 @@ actor PlaybackSessionBridge {
             )
         } ?? active.plan.selectedTracks.audio
         let selectedSubtitle: PlaybackV3TrackIdentity? = {
-            if isSeekReanchor { return active.plan.selectedTracks.subtitle }
+            if preservesRoute { return active.plan.selectedTracks.subtitle }
             if classification == "subtitle_track_changed" {
                 return subtitleTrackIndex.flatMap { index in
                     guard index >= 0 else { return nil }
@@ -1486,10 +1568,7 @@ actor PlaybackSessionBridge {
             clientCapabilities: active.snapshot.capabilities,
             clientPlaybackContext: active.snapshot.context
         )
-        let response = try await SiloAPI.shared.replanPlaybackV3(
-            sessionId: currentSessionId,
-            request: request
-        )
+        let response = try await mutationCoordinator.replan(sessionID: currentSessionId, request: request)
         let validatedResponse = response.validatedForApple()
         guard isCurrentProtocolV3Attempt(expectedAttempt, sessionId: currentSessionId) else {
             discardStaleProtocolV3Response(validatedResponse)
@@ -1566,24 +1645,20 @@ actor PlaybackSessionBridge {
                 throw error
             }
             let nextKey = nextPlan.planAttemptKey
-            guard isSeekReanchor || !attemptedKeys.contains(nextKey) else {
+            let preservesAttempt: Bool
+            do {
+                preservesAttempt = try Self.replanPreservesAttempt(operation: operation,
+                    usesV2: usesV2,
+                    currentSessionID: currentSessionId, nextSessionID: nextSessionId,
+                    current: active.plan, next: nextPlan, attemptedKeys: attemptedKeys,
+                    responseFeatures: response.serverFeatures)
+            } catch let failure as PlaybackV3TerminalFailure {
                 if nextSessionId != currentSessionId {
-                    await retireAbandonedSession(
-                        nextSessionId,
-                        reason: "replan_loop_detected"
-                    )
+                    await retireAbandonedSession(nextSessionId, reason: failure.reason)
                 }
-                await emitProtocolV3Terminal(
-                    active: active,
-                    sessionId: currentSessionId,
-                    reason: "replan_loop_detected",
-                    message: "The server returned a protocol V3 plan that already failed on this output route."
-                )
-                throw PlaybackV3TerminalFailure(
-                    reason: "replan_loop_detected",
-                    message: "The server returned a protocol V3 plan that already failed on this output route.",
-                    retryable: false
-                )
+                await emitProtocolV3Terminal(active: active, sessionId: currentSessionId,
+                    reason: failure.reason, message: failure.message)
+                throw failure
             }
             guard let selectedVersion = watchDetail.versions.first(where: {
                 $0.fileId == nextPlan.effectiveMediaFileId
@@ -1612,29 +1687,7 @@ actor PlaybackSessionBridge {
                 selectedVersion: selectedVersion,
                 serverFeatures: response.serverFeatures
             )
-            if isSeekReanchor {
-                guard nextSessionId == currentSessionId,
-                      response.serverFeatures.contains(PlaybackProtocolV3.seekReanchorFeature),
-                      nextKey == active.planAttemptKey,
-                      nextPlan.delivery == active.plan.delivery,
-                      nextPlan.effectiveRecipe == active.plan.effectiveRecipe,
-                      nextPlan.selectedTracks == active.plan.selectedTracks,
-                      nextPlan.transformations == active.plan.transformations,
-                      nextPlan.appliedQuirks == active.plan.appliedQuirks,
-                      nextPlan.runtimeCorrections == active.plan.runtimeCorrections else {
-                    await emitProtocolV3Terminal(
-                        active: active,
-                        sessionId: currentSessionId,
-                        reason: "invalid_seek_reanchor_response",
-                        message: "The server changed the route or playback intent during a V3 seek re-anchor."
-                    )
-                    throw PlaybackV3TerminalFailure(
-                        reason: "invalid_seek_reanchor_response",
-                        message: "The server changed the route or playback intent during a V3 seek re-anchor.",
-                        retryable: false
-                    )
-                }
-            } else {
+            if !preservesAttempt {
                 active.planAttemptId = "apple-plan:\(UUID().uuidString.lowercased())"
                 active.planAttemptKey = nextKey
                 active.attemptedPlanKeys = attemptedKeys + [nextKey]
@@ -1761,7 +1814,7 @@ actor PlaybackSessionBridge {
             diagnostics: diagnostics
         )
         do {
-            try await SiloAPI.shared.reportPlaybackRouteEventV3(event)
+            try await mutationCoordinator.reportRouteEvent(event)
         } catch {
             logger.warning("Protocol V3 route event \(event.event, privacy: .public) failed: \(MediaLogRedactor.sanitize(error), privacy: .public)")
         }
@@ -1865,6 +1918,16 @@ actor PlaybackSessionBridge {
         guard let sid = sessionId else { return .transientFailure }
         guard position.isFinite, position >= 0 else { return .transientFailure }
 
+        if sequencedSessionIDs.contains(sid) {
+            do {
+                try await mutationCoordinator.report(sessionID: sid, position: position, isPaused: isPaused)
+                return .success
+            } catch {
+                logger.warning("Sequenced playback progress remains pending: \(MediaLogRedactor.sanitize(error), privacy: .public)")
+                // A rejected bound session cannot be silently renewed as a new attempt.
+                return .transientFailure
+            }
+        }
         let report = ProgressReport(position: position, isPaused: isPaused)
         do {
             try await SiloAPI.shared.reportPlaybackProgress(
@@ -1945,11 +2008,15 @@ actor PlaybackSessionBridge {
     /// clearing it after those awaits let a second caller — teardown racing an
     /// autoplay transition — claim the same id and send a duplicate final
     /// progress report and a duplicate DELETE. Claiming the id and clearing all
-    /// session-scoped state up front makes the loser a no-op. It also stops the
+    /// session-scoped state up front makes concurrent callers share the retirement
+    /// result, including terminal abandonment. It also stops the
     /// late clears from wiping a *new* session adopted while these awaits were
     /// still in flight.
-    func stopSession(position: Double, isPaused: Bool) async {
-        guard let sid = sessionId else { return }
+    @discardableResult
+    func stopSession(position: Double, isPaused: Bool) async -> PlaybackSessionStopResolution {
+        guard let sid = sessionId else {
+            return await retiringSession?.value ?? .noSession
+        }
         let stoppingProtocolV3 = activeProtocolV3
         let supersededSessionId = pendingProtocolV3Transition?.priorSessionId
 
@@ -1961,6 +2028,16 @@ actor PlaybackSessionBridge {
         consecutiveProgressFailures = 0
         emittedOrphanedSessionWarning = false
 
+        let retirement = Task { @MainActor in
+            await self.finishStoppedSession(sid, active: stoppingProtocolV3,
+                supersededSessionId: supersededSessionId, position: position, isPaused: isPaused)
+        }
+        retiringSession = retirement
+        return await retirement.value
+    }
+
+    private func finishStoppedSession(_ sid: String, active stoppingProtocolV3: ActiveProtocolV3?,
+        supersededSessionId: String?, position: Double, isPaused: Bool) async -> PlaybackSessionStopResolution {
         if let supersededSessionId, supersededSessionId != sid {
             stopStaleSession(supersededSessionId)
         }
@@ -1968,7 +2045,7 @@ actor PlaybackSessionBridge {
         DiagnosticsCoordinator.recordBreadcrumb(
             category: .playback,
             tag: "PlaybackSession",
-            message: "playback session stopped",
+            message: sequencedSessionIDs.contains(sid) ? "local playback closed; server stop pending" : "playback session stopped",
             attrs: [
                 "session_id": .string(sid),
                 // The attribute registry has no float type, so playback
@@ -1990,6 +2067,18 @@ actor PlaybackSessionBridge {
                         String(position.isFinite ? max(0, position) : 0),
                 ]
             )
+        }
+
+        if sequencedSessionIDs.contains(sid) {
+            do {
+                return try await mutationCoordinator.stop(sessionID: sid, position: position, isPaused: isPaused) ? .closed : .pending
+            }
+            catch let failure as PlaybackV3TerminalFailure where failure.reason == "playback_owner_lost" {
+                logger.info("Playback ended after server owner loss; pending final sample was not applied")
+                return .ownerLost
+            }
+            catch { logger.error("Playback stop remains pending: \(MediaLogRedactor.sanitize(error), privacy: .public)") }
+            return .pending
         }
 
         if position.isFinite, position >= 0 {
@@ -2021,6 +2110,7 @@ actor PlaybackSessionBridge {
         // Nudge the Top Shelf to re-fetch now that progress has advanced.
         TVTopShelfContentProvider.topShelfContentDidChange()
         #endif
+        return .closed
     }
 
     // MARK: - Helpers

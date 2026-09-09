@@ -8,7 +8,7 @@
 //  translation/transcription (translate an existing track, transcribe
 //  audio via Whisper, or transcribe-and-translate).
 //
-//  All of these ride the native API (`/api/v1/...`) and go through
+//  These use native v1/v2 contracts through
 //  ``HTTPClient/shared``, whose coders are `.convertFromSnakeCase` /
 //  `.convertToSnakeCase`. Properties therefore stay camelCase with no
 //  `CodingKeys` boilerplate; the only exception is
@@ -18,10 +18,10 @@
 //  Endpoints in play (see ``SiloAI``):
 //    GET  /api/v1/metadata/ai/status
 //    POST /api/v1/items/{id}/translate-description
-//    GET  /api/v1/subtitles/ai/status
-//    GET  /api/v1/subtitles/ai/quota
+//    GET  /api/v2/subtitles/ai/status
+//    GET  /api/v2/subtitles/ai/quota
 //    POST /api/v1/subtitles/ai/translate
-//    GET  /api/v1/subtitles/ai/jobs/{job_id}
+//    GET  /api/v2/subtitles/ai/jobs/{job_id}
 //    GET  /api/v1/subtitles/ai/jobs?media_file_id=N
 //    POST /api/v1/subtitles/ai/jobs/{job_id}/cancel
 //    GET  /api/v1/subtitles/{media_file_id}
@@ -55,7 +55,7 @@ enum AIJobStatus: String, Codable {
 
 // MARK: - Metadata AI
 
-/// `GET /api/v1/metadata/ai/status`. `enabled` gates the metadata-language
+/// Native projection of the v2 metadata capability. `enabled` gates the metadata-language
 /// setting + the on-view translate affordance; `onView` decides whether the
 /// affordance is a button, auto-fires, or is hidden.
 struct MetadataAIStatus: Codable {
@@ -76,6 +76,10 @@ struct MetadataAIStatus: Codable {
         }
     }
 
+    init(enabled: Bool, onView: OnViewMode) {
+        self.enabled = enabled; self.onView = onView
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
@@ -83,16 +87,15 @@ struct MetadataAIStatus: Codable {
     }
 }
 
-/// Body for `POST /api/v1/items/{id}/translate-description` (202, no
-/// response body — observe completion by re-fetching the item detail
-/// until `pendingTranslationLanguage` clears).
+/// Body for the v2 catalog description action;202 returns a bare job.
+/// Completion remains observable through authorized item-detail reads.
 struct TranslateDescriptionBody: Encodable {
     let targetLanguage: String
 }
 
 // MARK: - Subtitle AI
 
-/// `GET /api/v1/subtitles/ai/status`. `transcribeEnabled` additionally
+/// `GET /api/v2/subtitles/ai/status`. `transcribeEnabled` additionally
 /// gates the Whisper transcription controls + the quota gauge.
 struct SubtitleAIStatus: Codable {
     let enabled: Bool
@@ -105,7 +108,7 @@ struct SubtitleAIStatus: Codable {
     }
 }
 
-/// `GET /api/v1/subtitles/providers/status`. Whether the server has any
+/// `GET /api/v2/subtitles/providers/status`. Whether the server has any
 /// external subtitle providers (OpenSubtitles / SubDL / Subsource)
 /// configured, so the client can disable the in-player "Search Subtitles…"
 /// entry point instead of running a fan-out search that can only return
@@ -196,6 +199,39 @@ struct SubtitleJob: Codable, Identifiable, Equatable {
     let errorMessage: String?
     let createdAt: String?
     let updatedAt: String?
+
+    /// Keep job identity opaque; only the existing player subtitle handles
+    /// require checked integer projection.
+    init(v2 job: APIv2SubtitleJob, expectedJobID: String) throws {
+        guard job.id == expectedJobID,
+              let knownKind = SubtitleAIKind(rawValue: job.kind),
+              let fileID = Int(job.mediaFileId), fileID > 0,
+              String(fileID) == job.mediaFileId else { throw APIv2Error.invalidSubtitleResponse }
+        let resultID: Int?
+        if let raw = job.resultSubtitleId {
+            guard let value = Int(raw), value > 0, String(value) == raw else {
+                throw APIv2Error.invalidSubtitleResponse
+            }
+            resultID = value
+        } else {
+            resultID = nil
+        }
+        id = job.id
+        mediaFileId = fileID
+        kind = knownKind
+        sourceIndex = job.sourceIndex
+        sourceLanguage = job.sourceLanguage
+        targetLanguage = job.targetLanguage
+        engine = job.engine
+        model = job.model
+        status = job.status
+        progress = job.progress
+        progressMessage = job.progressMessage
+        resultSubtitleId = resultID
+        errorMessage = job.errorMessage
+        createdAt = job.createdAt
+        updatedAt = job.updatedAt
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -343,13 +379,21 @@ extension DownloadedSubtitle {
     ///   resolved.
     func synthesizedDescriptor(
         sessionId: String,
+        executorReference: String,
         baseTrackCount: Int,
         position: Int,
         resolveURL: (String) -> URL?
     ) -> SidecarSubtitleDescriptor? {
+        guard UUID(uuidString: sessionId) != nil, !executorReference.isEmpty,
+              baseTrackCount >= 0, position >= 0, baseTrackCount <= Int.max - position,
+              mediaFileId > 0, id > 0 else { return nil }
         let combinedIndex = baseTrackCount + position
-        let path = "/stream/\(sessionId)/subtitles/\(combinedIndex)\(streamURLExtension)"
-        guard let url = resolveURL(path) else { return nil }
+        var path = URLComponents()
+        path.path = "/api/v2/stream/\(sessionId)/subtitles/\(combinedIndex)\(streamURLExtension)"
+        path.queryItems = [URLQueryItem(name: "st", value: executorReference),
+            URLQueryItem(name: "file_id", value: String(mediaFileId)),
+            URLQueryItem(name: "downloaded_subtitle_id", value: String(id))]
+        guard let relative = path.string, let url = resolveURL(relative) else { return nil }
         let label = releaseName.isEmpty
             ? (provider.isEmpty ? language : provider)
             : (provider.isEmpty ? releaseName : "\(releaseName) (\(provider))")
@@ -376,4 +420,22 @@ struct DownloadedSubtitlesResponse: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         subtitles = try c.decodeIfPresent([DownloadedSubtitle].self, forKey: .subtitles) ?? []
     }
+}
+
+
+struct APIv2MetadataAICapability: Decodable {
+    let state: String
+    let revision: String
+    let onView: MetadataAIStatus.OnViewMode
+    var playerValue: MetadataAIStatus {
+        MetadataAIStatus(enabled: state == "available", onView: state == "available" ? onView : .off)
+    }
+}
+struct APIv2MetadataTranslationJob: Decodable {
+    let id: String
+    let targetKind: String
+    let contentId: String
+    let targetLanguage: String
+    let status: String
+    var failed: Bool { status == "failed" || status == "canceled" || status == "cancelled" }
 }

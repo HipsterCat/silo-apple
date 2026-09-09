@@ -99,12 +99,13 @@ final class HomeSectionsMutationTests: XCTestCase {
         var receivedContentId: String?
         var receivedProgressTimestamp: String?
         let viewModel = HomeViewModel(
-            dismissContinueWatching: { contentId, progressUpdatedAt in
+            dismissContinueWatching: { contentId, progressUpdatedAt, _ in
                 receivedContentId = contentId
                 receivedProgressTimestamp = progressUpdatedAt
             }
         )
 
+        viewModel.sections = sections
         await viewModel.dismissContinueWatchingItem(target)
 
         let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
@@ -134,15 +135,16 @@ final class HomeSectionsMutationTests: XCTestCase {
         var receivedContentId: String?
         var receivedSeriesId: String?
         let viewModel = HomeViewModel(
-            dismissContinueWatching: { _, _ in
+            dismissContinueWatching: { _, _, _ in
                 continueWatchingCalls += 1
             },
-            dismissNextUp: { contentId, seriesId in
+            dismissNextUp: { contentId, seriesId, _ in
                 receivedContentId = contentId
                 receivedSeriesId = seriesId
             }
         )
 
+        viewModel.sections = sections
         await viewModel.dismissContinueWatchingItem(target)
 
         let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
@@ -164,10 +166,11 @@ final class HomeSectionsMutationTests: XCTestCase {
         defer { ResponseCache.shared.remove(CacheKey.homeSections) }
 
         let viewModel = HomeViewModel(
-            dismissContinueWatching: { _, _ in XCTFail("unexpected continue_watching dismissal") },
-            dismissNextUp: { _, _ in XCTFail("unexpected next_up dismissal") }
+            dismissContinueWatching: { _, _, _ in XCTFail("unexpected continue_watching dismissal") },
+            dismissNextUp: { _, _, _ in XCTFail("unexpected next_up dismissal") }
         )
 
+        viewModel.sections = sections
         await viewModel.dismissContinueWatchingItem(target)
 
         let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
@@ -186,11 +189,12 @@ final class HomeSectionsMutationTests: XCTestCase {
         defer { ResponseCache.shared.remove(CacheKey.homeSections) }
 
         let viewModel = HomeViewModel(
-            dismissContinueWatching: { _, _ in
+            dismissContinueWatching: { _, _, _ in
                 throw TestError.failed
             }
         )
 
+        viewModel.sections = sections
         await viewModel.dismissContinueWatchingItem(target)
 
         let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
@@ -214,18 +218,17 @@ final class HomeSectionsMutationTests: XCTestCase {
         var receivedContentId: String?
         var receivedPlayed: Bool?
         let viewModel = HomeViewModel(
-            setWatched: { contentId, played in
+            setWatched: { contentId, played, _ in
                 receivedContentId = contentId
                 receivedPlayed = played
             },
-            fetchHomeSections: {
-                // A reconciliation failure must not undo the committed local
-                // update or require a manual pull-to-refresh.
-                throw TestError.failed
-            }
+            fetchHomeSections: { SectionsResponse(sections: sections) },
+            reconcileHomeSections: { _ in throw TestError.failed },
+            responseIsCurrent: { _ in true }
         )
 
-        let succeeded = await viewModel.setWatched(target, played: true)
+        await viewModel.loadSections()
+        let succeeded = await viewModel.setWatched(target, played: true, auth: nil)
 
         let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
         XCTAssertTrue(succeeded)
@@ -234,9 +237,7 @@ final class HomeSectionsMutationTests: XCTestCase {
         XCTAssertEqual(viewModel.sections[0].items.map(\.contentId), ["other"])
         XCTAssertEqual(viewModel.sections[0].totalCount, 1)
         XCTAssertEqual(viewModel.sections[1].items.map(\.contentId), ["target"])
-        XCTAssertEqual(cached?.sections[0].items.map(\.contentId), ["other"])
-        XCTAssertEqual(cached?.sections[0].totalCount, 1)
-        XCTAssertEqual(cached?.sections[1].items.map(\.contentId), ["target"])
+        XCTAssertNil(cached)
         XCTAssertNil(viewModel.actionError)
     }
 
@@ -250,12 +251,15 @@ final class HomeSectionsMutationTests: XCTestCase {
         defer { ResponseCache.shared.remove(CacheKey.homeSections) }
 
         let viewModel = HomeViewModel(
-            setWatched: { _, _ in
+            setWatched: { _, _, _ in
                 throw TestError.failed
-            }
+            },
+            fetchHomeSections: { SectionsResponse(sections: sections) },
+            responseIsCurrent: { _ in true }
         )
 
-        let succeeded = await viewModel.setWatched(target, played: true)
+        await viewModel.loadSections()
+        let succeeded = await viewModel.setWatched(target, played: true, auth: nil)
 
         let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
         XCTAssertFalse(succeeded)
@@ -279,7 +283,8 @@ final class HomeSectionsMutationTests: XCTestCase {
                 id: "continue", type: "continue_watching", totalCount: 1, items: [updated]
             )])
             ResponseCache.shared.set(stale, for: CacheKey.homeSections)
-            let model = HomeViewModel(fetchHomeSections: { fresh })
+            let model = HomeViewModel(fetchHomeSections: { fresh }, responseIsCurrent: { _ in true })
+            model.sections = stale.sections
             let refresh = StartupContentPrefetcher.homeRefreshAfterPlaybackWrite()
             let received = expectation(description: "Home refresh after \(contentId) progress write")
             let observer = NotificationCenter.default.addObserver(

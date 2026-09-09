@@ -45,6 +45,7 @@ struct TVMediaCard: View {
     /// Catalog identity for the long-press favorite/watchlist menu.
     /// `nil` (or a nil `userState`) leaves the card without a menu.
     var contentId: String? = nil
+    var libraryCardContext: TVLibraryCardContext? = nil
 
     enum FocusTreatment {
         case nativeCard
@@ -52,6 +53,11 @@ struct TVMediaCard: View {
     }
 
     @FocusState private var isFocused: Bool
+    @State private var catalogActionRun: UUID?
+    @Environment(\.catalogMembershipModel) private var catalogModel
+    @State private var searchActionRun: UUID?
+    @Environment(\.catalogSearchModel) private var searchModel
+    @State private var cardActionRun: UUID?
     @State private var favoriteOverride: Bool?
     @State private var watchlistOverride: Bool?
     @State private var uiCustomization = UICustomizationPreferences.shared
@@ -79,16 +85,28 @@ struct TVMediaCard: View {
             }
         }
         .frame(width: resolvedCardWidth)
-        .onChange(of: userState) { _, _ in
-            favoriteOverride = nil
-            watchlistOverride = nil
-        }
+        .onChange(of: catalogModel?.displayedRead) { _, _ in resetCatalogAction() }
+        .onChange(of: catalogModel?.cardGeneration) { _, _ in resetCatalogAction() }
+        .onChange(of: catalogModel.map { ObjectIdentifier($0) }) { _, _ in resetCatalogAction() }
+        .onChange(of: contentId) { _, _ in resetCatalogAction() }
+        .onDisappear { if catalogModel != nil { resetCatalogAction() } }
+        .onChange(of: searchModel?.displayedRead) { _, _ in resetPersonalOverrides() }
+        .onChange(of: searchModel?.cardGeneration) { _, _ in resetPersonalOverrides() }
+        .onChange(of: searchModel.map { ObjectIdentifier($0) }) { _, _ in resetPersonalOverrides() }
+        .onChange(of: userState) { _, _ in resetPersonalOverrides() }
+        .onChange(of: contentId) { _, _ in resetPersonalOverrides() }
+        .onChange(of: libraryCardContext?.libraryId) { _, _ in resetPersonalOverrides() }
+        .onChange(of: libraryCardContext.map { ObjectIdentifier($0.model) }) { _, _ in resetPersonalOverrides() }
+        .onChange(of: libraryCardContext?.model.displayedRead) { _, _ in resetPersonalOverrides() }
+        .onChange(of: libraryCardContext?.model.cardGeneration) { _, _ in resetPersonalOverrides() }
+        .onDisappear { resetPersonalOverrides() }
     }
 
     // MARK: - Favorite / watchlist context actions
 
     private var hasPersonalActions: Bool {
-        contentId != nil && userState != nil
+        contentId != nil && userState != nil && (catalogModel?.displayedRead != nil
+            || searchModel?.displayedRead != nil || libraryCardContext?.model.displayedRead != nil)
     }
 
     private var isFavorite: Bool {
@@ -108,31 +126,87 @@ struct TVMediaCard: View {
         )
     }
 
-    private func togglePersonalFavorite() {
-        guard let contentId else { return }
-        let newValue = !isFavorite
-        let watchlist = isInWatchlist
-        favoriteOverride = newValue
+    private func resetPersonalOverrides() {
+        searchActionRun = nil
+        cardActionRun = nil
+        favoriteOverride = nil
+        watchlistOverride = nil
+    }
+
+    private func toggleLibraryMembership(_ target: APIv2PersonalListKind, context: TVLibraryCardContext) {
+        guard let contentId, cardActionRun == nil else { return }
+        let included = target == .favorites ? !isFavorite : !isInWatchlist
+        guard let action = context.model.prepareCardAction(contentId: contentId, target: target,
+            included: included, libraryId: context.libraryId) else { return }
+        cardActionRun = action.id
+        if target == .favorites { favoriteOverride = included } else { watchlistOverride = included }
         Task {
-            if await PersonalListSync.setFavorite(
-                contentId: contentId, isFavorite: newValue, inWatchlist: watchlist
-            ) == false {
-                favoriteOverride = !newValue // Revert on failure
+            let result = await context.model.performCardAction(action)
+            guard cardActionRun == action.id, self.contentId == contentId,
+                  libraryCardContext?.model === context.model,
+                  libraryCardContext?.libraryId == context.libraryId else { return }
+            cardActionRun = nil
+            // A successful model receipt owns the new flag. Failure/staleness
+            // falls back to the displayed model rather than inventing state.
+            if result != true {
+                if target == .favorites { favoriteOverride = nil } else { watchlistOverride = nil }
             }
         }
     }
 
-    private func togglePersonalWatchlist() {
-        guard let contentId else { return }
-        let newValue = !isInWatchlist
-        let favorite = isFavorite
-        watchlistOverride = newValue
-        Task {
-            if await PersonalListSync.setWatchlist(
-                contentId: contentId, isFavorite: favorite, inWatchlist: newValue
-            ) == false {
-                watchlistOverride = !newValue // Revert on failure
+    private func resetCatalogAction() {
+        catalogActionRun = nil
+        favoriteOverride = nil
+        watchlistOverride = nil
+    }
+
+    private func toggleCatalogMembership(_ target: APIv2PersonalListKind, model: any CatalogMembershipModel) {
+        guard let contentId, catalogActionRun == nil else { return }
+        let included = target == .favorites ? !isFavorite : !isInWatchlist
+        guard let action = model.prepareCardAction(contentId: contentId, target: target, included: included) else { return }
+        catalogActionRun = action.id
+        if target == .favorites { favoriteOverride = included } else { watchlistOverride = included }
+        Task { @MainActor in
+            let result = await model.performCardAction(action)
+            guard catalogActionRun == action.id, catalogModel === model, self.contentId == contentId else { return }
+            catalogActionRun = nil
+            if result != true {
+                if target == .favorites { favoriteOverride = nil } else { watchlistOverride = nil }
             }
+        }
+    }
+
+    private func toggleSearchMembership(_ target: APIv2PersonalListKind, model: SearchViewModel) {
+        guard let contentId, searchActionRun == nil else { return }
+        let included = target == .favorites ? !isFavorite : !isInWatchlist
+        guard let action = model.prepareCardAction(contentId: contentId, target: target, included: included) else { return }
+        searchActionRun = action.id
+        if target == .favorites { favoriteOverride = included } else { watchlistOverride = included }
+        Task { @MainActor in
+            let result = await model.performCardAction(action)
+            guard searchActionRun == action.id, searchModel === model, self.contentId == contentId else { return }
+            searchActionRun = nil
+            if result != true {
+                if target == .favorites { favoriteOverride = nil } else { watchlistOverride = nil }
+            }
+        }
+    }
+
+    private func togglePersonalFavorite() {
+        if let catalogModel { toggleCatalogMembership(.favorites, model: catalogModel); return }
+        if let searchModel { toggleSearchMembership(.favorites, model: searchModel); return }
+        if let libraryCardContext {
+            toggleLibraryMembership(.favorites, context: libraryCardContext)
+            return
+        }
+    }
+
+    private func togglePersonalWatchlist() {
+        if let catalogModel { toggleCatalogMembership(.watchlist, model: catalogModel); return }
+        if let searchModel { toggleSearchMembership(.watchlist, model: searchModel); return }
+        if let libraryCardContext {
+            toggleLibraryMembership(.watchlist, context: libraryCardContext)
+            return
         }
     }
 

@@ -13,53 +13,88 @@ class RecommendationsViewModel {
     /// server's order.
     private static let forYouTitle = "for you"
 
-    init() {
-        if let cached: SectionsResponse = ResponseCache.shared.get(CacheKey.recommendations) {
-            sections = sortedNonEmptySections(from: cached.sections)
-        }
+    private let api: SiloAPI
+    private let tokens: TokenStore
+    @ObservationIgnored private var requestToken = 0
+    private(set) var displayedAuth: CapturedOrdinaryRequestAuth?
+    let membership: ReadOwnedMembershipModel
+
+    init(api: SiloAPI = .shared, tokens: TokenStore = .shared) {
+        self.api = api
+        self.tokens = tokens
+        membership = ReadOwnedMembershipModel(api: api.v2, tokens: tokens)
     }
 
     func loadRecommendations() async {
         #if os(iOS)
-        // MainTabView starts this before the lazy For You tab is constructed.
-        // If the destination appears while that same model is still loading,
-        // keep observing the in-flight result instead of scheduling duplicate
-        // view work around the shared network single-flight.
         guard !isLoading, !isRefreshing else { return }
         #endif
-
-        if sections.isEmpty {
-            isLoading = true
-        } else {
-            isRefreshing = true
-        }
-        error = nil
-
-        do {
-            let response = try await StartupContentPrefetcher.fetchRecommendations()
-            sections = sortedNonEmptySections(from: response.sections)
-        } catch let err {
-            if sections.isEmpty {
-                self.error = ErrorState(err)
-            }
-        }
-
-        isLoading = false
-        isRefreshing = false
+        await load()
     }
 
-    /// Pull-to-refresh variant — keeps existing content on screen while the
-    /// network call is in flight so the list doesn't jump back to a spinner.
-    func refresh() async {
-        isRefreshing = true
-        do {
-            let response = try await StartupContentPrefetcher.fetchRecommendations()
-            sections = sortedNonEmptySections(from: response.sections)
-            error = nil
-        } catch let err {
-            self.error = ErrorState(err)
+    func refresh() async { await load() }
+
+    private func load() async {
+        requestToken += 1
+        let run = requestToken
+        let revisionAtStart = membership.mutationRevision
+        guard let auth = await tokens.captureOrdinaryRequestAuth(), auth.profileId != nil else {
+            guard run == requestToken, !Task.isCancelled else { return }
+            clearDisplayedRead(); isLoading = false; isRefreshing = false
+            error = ErrorState(HTTPError.requestIdentityChanged)
+            return
         }
-        isRefreshing = false
+        let mayRead = await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+        guard run == requestToken, !Task.isCancelled else { return }
+        guard mayRead else { clearDisplayedRead(); isLoading = false; isRefreshing = false; return }
+        guard revisionAtStart == membership.mutationRevision else { return }
+        if displayedAuth.map({ StartupContentPrefetcher.sameRecommendationOwner($0, auth) }) != true {
+            // Only a new owner may hydrate an initial display from its scoped cache.
+            // Repainting an existing response must preserve accepted mutation flags
+            // and its card generation until a fresh response is validated below.
+            let cached = StartupContentPrefetcher.cachedRecommendations(auth: auth)
+            sections = cached.map { sortedNonEmptySections(from: $0.sections) } ?? []
+            displayedAuth = auth
+            publishMembership()
+        }
+        isLoading = sections.isEmpty
+        isRefreshing = !sections.isEmpty
+        error = nil
+        defer {
+            if run == requestToken { isLoading = false; isRefreshing = false }
+        }
+        do {
+            let revision = membership.mutationRevision
+            let response = try await StartupContentPrefetcher.fetchRecommendations(auth: auth, api: api, tokens: tokens)
+            let mayPublish = await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard run == requestToken, !Task.isCancelled else { return }
+            guard mayPublish else { clearDisplayedRead(); return }
+            guard revision == membership.mutationRevision else {
+                ResponseCache.shared.remove(CacheKey.recommendations)
+                return
+            }
+            sections = sortedNonEmptySections(from: response.sections)
+            displayedAuth = auth
+            publishMembership()
+        } catch {
+            let current = await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard run == requestToken, !Task.isCancelled else { return }
+            guard current else { clearDisplayedRead(); return }
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+            self.error = ErrorState(error)
+        }
+    }
+
+    private func clearDisplayedRead() {
+        sections = []
+        displayedAuth = nil
+        publishMembership()
+    }
+
+    private func publishMembership() {
+        let owner = displayedAuth.map { CatalogCardOwner(auth: $0, scope: "recommendations", filterKey: "") }
+        membership.publish(owner: owner, rows: sections.flatMap { $0.items.map { ($0.contentId, $0.userState) } },
+            cacheKeys: [CacheKey.recommendations])
     }
 
     private func sortedNonEmptySections(from raw: [ResolvedSection]) -> [ResolvedSection] {

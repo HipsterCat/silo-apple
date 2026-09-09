@@ -1,11 +1,18 @@
 import Foundation
 
-// MARK: - Capability (GET /api/v1/downloads/capability)
+// MARK: - Persisted download capability
 
 /// Server-advertised download feature gate. Fetched at login + profile
 /// switch; the UI is hidden when `enabled`/`downloadAllowed` is false.
 /// Mirrors §3 of the server downloads API guide.
 struct DownloadCapability: Codable, Hashable, Sendable {
+    var registryRevision: String? = nil
+    var registryState: String? = nil
+    var proxyDelivery: Bool? = nil
+    var orderedStatus: Bool? = nil
+    var subscriptionMutations: Bool? = nil
+    var boundedSubscriptionSync: Bool? = nil
+    var subscriptionReads: Bool? = nil
     let enabled: Bool
     let downloadAllowed: Bool
     let qualityPresets: [String]
@@ -24,6 +31,7 @@ struct DownloadCapability: Codable, Hashable, Sendable {
     var formats: [String] { qualityPresets }
 
     private enum CodingKeys: String, CodingKey {
+        case registryRevision, registryState, proxyDelivery, orderedStatus, subscriptionMutations, boundedSubscriptionSync, subscriptionReads
         case enabled
         case downloadAllowed
         case qualityPresets
@@ -57,6 +65,14 @@ struct DownloadCapability: Codable, Hashable, Sendable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        registryRevision = try container.decodeIfPresent(String.self, forKey: .registryRevision)
+        registryState = try container.decodeIfPresent(String.self, forKey: .registryState)
+        proxyDelivery = try container.decodeIfPresent(Bool.self, forKey: .proxyDelivery)
+        orderedStatus = try container.decodeIfPresent(Bool.self, forKey: .orderedStatus)
+        subscriptionMutations = try container.decodeIfPresent(Bool.self, forKey: .subscriptionMutations)
+        boundedSubscriptionSync = try container.decodeIfPresent(Bool.self, forKey: .boundedSubscriptionSync)
+        subscriptionReads = try container.decodeIfPresent(Bool.self, forKey: .subscriptionReads)
+
         enabled = try container.decode(Bool.self, forKey: .enabled)
         downloadAllowed = try container.decode(Bool.self, forKey: .downloadAllowed)
         qualityPresets = try container.decodeIfPresent([String].self, forKey: .qualityPresets)
@@ -71,6 +87,14 @@ struct DownloadCapability: Codable, Hashable, Sendable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(registryRevision, forKey: .registryRevision)
+        try container.encodeIfPresent(registryState, forKey: .registryState)
+        try container.encodeIfPresent(proxyDelivery, forKey: .proxyDelivery)
+        try container.encodeIfPresent(orderedStatus, forKey: .orderedStatus)
+        try container.encodeIfPresent(subscriptionMutations, forKey: .subscriptionMutations)
+        try container.encodeIfPresent(boundedSubscriptionSync, forKey: .boundedSubscriptionSync)
+        try container.encodeIfPresent(subscriptionReads, forKey: .subscriptionReads)
+
         try container.encode(enabled, forKey: .enabled)
         try container.encode(downloadAllowed, forKey: .downloadAllowed)
         try container.encode(qualityPresets, forKey: .qualityPresets)
@@ -104,7 +128,7 @@ enum DownloadFormat: String, Codable, CaseIterable, Sendable {
     }
 }
 
-// MARK: - Download row (POST/GET /api/v1/downloads)
+// MARK: - Download row (legacy creation and v2 registry projection)
 
 /// A managed device download row as returned by create/list. Field
 /// reference: §5 of the server downloads API guide.
@@ -150,6 +174,30 @@ struct ServerDownloadRow: Decodable, Hashable, Sendable {
         case revision
         case createdAt
         case completedAt
+    }
+
+    init(v2 value: APIv2DownloadEntry) throws {
+        guard !value.id.isEmpty, !value.contentId.isEmpty, value.revision > 0,
+              let mediaID = Int(value.mediaFileId), mediaID > 0, String(mediaID) == value.mediaFileId else {
+            throw DownloadOwnershipError.incompleteAction
+        }
+        mediaFileId = mediaID
+        id = value.id
+        contentId = value.contentId
+        episodeId = value.episodeId
+        batchId = value.batchId
+        deviceId = value.deviceId
+        fileSize = value.fileSize
+        bytesSent = value.bytesSent
+        kind = value.kind
+        status = value.status
+        quality = value.quality
+        effectiveQuality = value.effectiveQuality
+        deliveryFormat = value.deliveryFormat
+        targetBitrateKbps = value.targetBitrateKbps
+        revision = value.revision
+        createdAt = value.createdAt
+        completedAt = value.completedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -356,7 +404,16 @@ struct OfflineManifest: Codable, Hashable, Sendable {
         effectiveQuality = try keyed.decodeIfPresent(String.self, forKey: .effectiveQuality)
         deliveryFormat = try keyed.decodeIfPresent(String.self, forKey: .deliveryFormat)
         targetBitrateKbps = try keyed.decodeIfPresent(Int.self, forKey: .targetBitrateKbps)
-        mediaFileId = try keyed.decodeIfPresent(Int.self, forKey: .mediaFileId) ?? 0
+        let wireVersion = try keyed.decodeIfPresent(Int.self, forKey: .manifestVersion)
+        if wireVersion == 3 {
+            let raw = try keyed.decode(String.self, forKey: .mediaFileId)
+            guard let id = Int(raw), id > 0, String(id) == raw else {
+                throw DownloadOwnershipError.incompleteAction
+            }
+            mediaFileId = id
+        } else {
+            mediaFileId = try keyed.decodeIfPresent(Int.self, forKey: .mediaFileId) ?? 0
+        }
         fileSize = try keyed.decodeIfPresent(Int64.self, forKey: .fileSize)
         title = try keyed.decode(String.self, forKey: .title)
         year = try keyed.decodeIfPresent(Int.self, forKey: .year)
@@ -402,7 +459,8 @@ struct OfflineManifest: Codable, Hashable, Sendable {
         try keyed.encodeIfPresent(effectiveQuality, forKey: .effectiveQuality)
         try keyed.encodeIfPresent(deliveryFormat, forKey: .deliveryFormat)
         try keyed.encodeIfPresent(targetBitrateKbps, forKey: .targetBitrateKbps)
-        try keyed.encode(mediaFileId, forKey: .mediaFileId)
+        if manifestVersion == 3 { try keyed.encode(String(mediaFileId), forKey: .mediaFileId) }
+        else { try keyed.encode(mediaFileId, forKey: .mediaFileId) }
         try keyed.encodeIfPresent(fileSize, forKey: .fileSize)
         try keyed.encode(title, forKey: .title)
         try keyed.encodeIfPresent(year, forKey: .year)
@@ -521,6 +579,7 @@ struct ServerSubscription: Codable, Hashable, Sendable {
     let active: Bool
     let createdAt: Date?
     let updatedAt: Date?
+    var etag: String? = nil
 }
 
 /// Subscription modes the client may request. Filtered against
@@ -640,6 +699,8 @@ struct DownloadRecord: Codable, Identifiable, Hashable, Sendable {
     var deliveryFormat: String? = nil
     var targetBitrateKbps: Int? = nil
     var revision: Int? = nil
+    var pendingStatusEvent: DownloadStatusEvent? = nil
+    var lastStatusEventAt: String? = nil
     var serverStatus: String
     var localStatus: LocalDownloadStatus
     var fileSize: Int64
@@ -709,7 +770,10 @@ struct DownloadSubscription: Codable, Identifiable, Hashable, Sendable {
     var maxStorageBytes: Int64
     var active: Bool
 
+    var etag: String? = nil
+
     init(from server: ServerSubscription, seriesTitle: String?) {
+        self.etag = server.etag
         self.id = server.id
         self.seriesId = server.seriesId
         self.seriesTitle = seriesTitle

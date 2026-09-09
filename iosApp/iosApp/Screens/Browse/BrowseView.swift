@@ -56,6 +56,7 @@ struct BrowseView: View {
         .refreshable {
             await viewModel.loadItems(reset: true)
         }
+        .onDisappear { viewModel.cancel() }
     }
 
     // MARK: - Content
@@ -99,6 +100,11 @@ struct BrowseView: View {
                     activeFilterChips
                 }
 
+                if let error = viewModel.error {
+                    Text(error.message).foregroundColor(.siloError)
+                    Button("Reload results") { Task { await viewModel.loadItems(reset: true) } }
+                }
+
                 CatalogGrid(
                     items: viewModel.items,
                     isLoading: viewModel.isLoading,
@@ -109,6 +115,7 @@ struct BrowseView: View {
                         Task { await viewModel.loadItems() }
                     }
                 )
+                .environment(\.catalogMembershipModel, viewModel)
                 .padding(.horizontal, SiloTheme.padding)
             }
         }
@@ -379,7 +386,7 @@ struct LibraryDetailView: View {
 
 @Observable
 @MainActor
-private class LibraryRecommendedViewModel {
+final class LibraryRecommendedViewModel {
     var sections: [ResolvedSection] = []
     var isLoading = false
     var isRefreshing = false
@@ -389,30 +396,53 @@ private class LibraryRecommendedViewModel {
         sections.filter { !$0.isFeatured && !$0.items.isEmpty }
     }
 
+    private let api: SiloAPI
+    private let tokens: TokenStore
+    private var loadGeneration = 0
+    private var displayedRead: APIv2LibrarySectionsRead?
+    func personalListAuth(libraryId: Int) -> CapturedOrdinaryRequestAuth? {
+        guard displayedRead?.libraryId == libraryId else { return nil }
+        return displayedRead?.auth
+    }
+
+    init(api: SiloAPI = .shared, tokens: TokenStore = .shared) {
+        self.api = api; self.tokens = tokens
+    }
+
     func loadSections(libraryId: Int) async {
-        let key = CacheKey.librarySections(libraryId)
-        if sections.isEmpty,
-           let cached: SectionsResponse = ResponseCache.shared.get(key) {
+        loadGeneration += 1
+        let generation = loadGeneration
+        if let displayedRead {
+            let current = await StartupContentPrefetcher.librarySectionsAreCurrent(displayedRead, libraryId: libraryId, tokens: tokens)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            if !current { sections = []; self.displayedRead = nil }
+        }
+        if let cached = await StartupContentPrefetcher.cachedLibrarySections(libraryId: libraryId, tokens: tokens) {
+            guard generation == loadGeneration, !Task.isCancelled else { return }
             sections = cached.sections.filter { !$0.items.isEmpty }
+            displayedRead = cached
         }
-        if sections.isEmpty {
-            isLoading = true
-        } else {
-            isRefreshing = true
-        }
+        guard generation == loadGeneration, !Task.isCancelled else { return }
+        isLoading = sections.isEmpty
+        isRefreshing = !sections.isEmpty
         error = nil
-
+        defer { if generation == loadGeneration { isLoading = false; isRefreshing = false } }
         do {
-            let response = try await StartupContentPrefetcher.fetchLibrarySections(libraryId: libraryId)
-            sections = response.sections.filter { !$0.items.isEmpty }
+            let read = try await StartupContentPrefetcher.fetchLibrarySections(libraryId: libraryId, api: api, tokens: tokens)
+            let current = await StartupContentPrefetcher.librarySectionsAreCurrent(read, libraryId: libraryId, tokens: tokens)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            guard current else { sections = []; return }
+            sections = read.sections.filter { !$0.items.isEmpty }
+            displayedRead = read
         } catch let err {
-            if sections.isEmpty {
-                error = ErrorState(err)
+            if let displayedRead {
+                let current = await StartupContentPrefetcher.librarySectionsAreCurrent(displayedRead, libraryId: libraryId, tokens: tokens)
+                guard generation == loadGeneration, !Task.isCancelled else { return }
+                if !current { sections = []; self.displayedRead = nil }
             }
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            if sections.isEmpty { error = ErrorState(err) }
         }
-
-        isLoading = false
-        isRefreshing = false
     }
 }
 
@@ -458,6 +488,7 @@ struct LibraryRecommendedView: View {
         .animation(.easeInOut(duration: 0.18), value: isRefreshing)
         .animation(.easeInOut(duration: 0.18), value: ConnectionMonitor.shared.isOffline)
         .siloPageBackground()
+        .environment(\.libraryCardAuthority, LibraryCardAuthority(libraryId: libraryId, auth: viewModel.personalListAuth(libraryId: libraryId)))
         .task(id: libraryId) {
             await viewModel.loadSections(libraryId: libraryId)
         }

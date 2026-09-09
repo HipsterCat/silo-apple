@@ -156,10 +156,11 @@ final class HomeSectionPreferences {
 class HomeViewModel {
     typealias DismissContinueWatching = (
         _ contentId: String,
-        _ progressUpdatedAt: String
+        _ progressUpdatedAt: String,
+        _ auth: CapturedOrdinaryRequestAuth?
     ) async throws -> Void
-    typealias DismissNextUp = (_ contentId: String, _ seriesId: String) async throws -> Void
-    typealias SetWatched = (_ contentId: String, _ played: Bool) async throws -> Void
+    typealias DismissNextUp = (_ contentId: String, _ seriesId: String, _ auth: CapturedOrdinaryRequestAuth?) async throws -> Void
+    typealias SetWatched = (_ contentId: String, _ played: Bool, _ auth: CapturedOrdinaryRequestAuth?) async throws -> Void
     typealias FetchHomeSections = () async throws -> SectionsResponse
 
     var sections: [ResolvedSection] = []
@@ -178,6 +179,11 @@ class HomeViewModel {
     private let dismissNextUp: DismissNextUp
     private let updateWatchedState: SetWatched
     private let fetchHomeSections: FetchHomeSections
+    private let reconcileHomeSections: (CapturedOrdinaryRequestAuth?) async throws -> SectionsResponse
+    private let responseIsCurrent: (SectionsResponse) async -> Bool
+    private var loadGeneration = 0
+    private var displayedHomeResponse: SectionsResponse?
+    var personalListAuth: CapturedOrdinaryRequestAuth? { displayedHomeResponse?.homeReadAuth }
 
     var isShowingActionError: Bool {
         get { actionError != nil }
@@ -196,62 +202,72 @@ class HomeViewModel {
     }
 
     init(
-        dismissContinueWatching: @escaping DismissContinueWatching = { contentId, progressUpdatedAt in
+        dismissContinueWatching: @escaping DismissContinueWatching = { contentId, progressUpdatedAt, auth in
             try await SiloAPI.shared.dismissContinueWatchingItem(
                 contentId: contentId,
-                progressUpdatedAt: progressUpdatedAt
+                progressUpdatedAt: progressUpdatedAt, auth: auth
             )
         },
-        dismissNextUp: @escaping DismissNextUp = { contentId, seriesId in
+        dismissNextUp: @escaping DismissNextUp = { contentId, seriesId, auth in
             try await SiloAPI.shared.dismissNextUpItem(
                 contentId: contentId,
-                seriesId: seriesId
+                seriesId: seriesId, auth: auth
             )
         },
-        setWatched: @escaping SetWatched = { contentId, played in
-            try await SiloAPI.shared.setWatched(contentId: contentId, played: played)
+        setWatched: @escaping SetWatched = { contentId, played, auth in
+            guard let auth else { throw HTTPError.requestIdentityChanged }
+            try await SiloAPI.shared.setWatched(contentId: contentId, played: played, auth: auth)
         },
         fetchHomeSections: @escaping FetchHomeSections = {
             try await StartupContentPrefetcher.fetchHomeSections()
+        },
+        reconcileHomeSections: @escaping (CapturedOrdinaryRequestAuth?) async throws -> SectionsResponse = { auth in
+            guard let auth else { throw HTTPError.requestIdentityChanged }
+            return try await StartupContentPrefetcher.fetchHomeSections(auth: auth)
+        },
+        responseIsCurrent: @escaping (SectionsResponse) async -> Bool = {
+            await StartupContentPrefetcher.homeResponseIsCurrent($0)
         }
     ) {
         self.dismissContinueWatching = dismissContinueWatching
         self.dismissNextUp = dismissNextUp
         self.updateWatchedState = setWatched
         self.fetchHomeSections = fetchHomeSections
-
-        // Hydrate from the shared cache so the first render after a
-        // navigation paints last-known data without any network wait.
-        if let cached: SectionsResponse = ResponseCache.shared.get(CacheKey.homeSections) {
-            sections = cached.sections.filter { !$0.items.isEmpty }
-        }
+        self.reconcileHomeSections = reconcileHomeSections
+        self.responseIsCurrent = responseIsCurrent
     }
 
     func loadSections() async {
-        if sections.isEmpty {
-            isLoading = true
-        } else {
-            isRefreshing = true
+        loadGeneration += 1
+        let generation = loadGeneration
+        if let displayedHomeResponse {
+            let current = await responseIsCurrent(displayedHomeResponse)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            if !current { sections = []; self.displayedHomeResponse = nil }
         }
+        if let cached = await StartupContentPrefetcher.cachedHomeSections() {
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            sections = cached.sections.filter { !$0.items.isEmpty }
+            displayedHomeResponse = cached
+        }
+        guard generation == loadGeneration, !Task.isCancelled else { return }
+        isLoading = sections.isEmpty
+        isRefreshing = !sections.isEmpty
         error = nil
-
+        defer {
+            if generation == loadGeneration { isLoading = false; isRefreshing = false }
+        }
         do {
-            try await fetchAndApplySections()
+            try await fetchAndApplySections(generation: generation)
         } catch let err {
-            // Don't blow away painted content on a transient failure —
-            // surface the error only when there's nothing to show.
+            guard generation == loadGeneration, !Task.isCancelled else { return }
             if sections.isEmpty {
                 let state = ErrorState(err)
                 if state.isTransient {
-                    await retryTransientInitialLoad()
-                } else {
-                    self.error = state
-                }
+                    await retryTransientInitialLoad(generation: generation)
+                } else { self.error = state }
             }
         }
-
-        isLoading = false
-        isRefreshing = false
     }
 
     /// The Continue Watching row mixes two kinds of cards, and the server keys
@@ -262,6 +278,9 @@ class HomeViewModel {
     /// a Next Up card is accepted by the server but never matches anything,
     /// so the card returns on the next fresh fetch.
     func dismissContinueWatchingItem(_ item: SectionItem) async {
+        let observation = displayedHomeResponse
+        let auth = observation?.homeReadAuth
+        let generation = loadGeneration
         let removal: (
             request: () async throws -> Void,
             mutate: (_ sections: [ResolvedSection]) -> [ResolvedSection]
@@ -269,7 +288,7 @@ class HomeViewModel {
         if let progressUpdatedAt = item.progressUpdatedAt {
             removal = (
                 request: { [dismissContinueWatching] in
-                    try await dismissContinueWatching(item.contentId, progressUpdatedAt)
+                    try await dismissContinueWatching(item.contentId, progressUpdatedAt, auth)
                 },
                 mutate: { sections in
                     HomeSectionsMutation.removingContinueWatchingItem(
@@ -281,7 +300,7 @@ class HomeViewModel {
         } else if let seriesId = item.seriesId, !seriesId.isEmpty {
             removal = (
                 request: { [dismissNextUp] in
-                    try await dismissNextUp(item.contentId, seriesId)
+                    try await dismissNextUp(item.contentId, seriesId, auth)
                 },
                 mutate: { sections in
                     HomeSectionsMutation.removingNextUpItem(
@@ -304,19 +323,49 @@ class HomeViewModel {
         actionError = nil
 
         do {
+            if let observation {
+                let current = await responseIsCurrent(observation)
+                guard current, generation == loadGeneration, !Task.isCancelled else { return }
+            }
+            guard containsDismissalAnchor(item), !Task.isCancelled else { return }
             try await removal.request()
+            if let observation {
+                let current = await responseIsCurrent(observation)
+                guard current, generation == loadGeneration, !Task.isCancelled else { return }
+            }
+            guard containsDismissalAnchor(item), !Task.isCancelled else { return }
 
             // A Home request that started before the dismissal can contain the
             // removed item. Invalidate that generation before committing the
             // authoritative local/cache update so a late response cannot put it
             // back on screen.
+            loadGeneration += 1
+            isLoading = false
+            isRefreshing = false
             StartupContentPrefetcher.invalidateHomeSectionsInFlight()
             sections = removal.mutate(sections)
             ResponseCache.shared.update(CacheKey.homeSections, as: SectionsResponse.self) { response in
+                if let auth {
+                    guard let owner = response.homeReadAuth,
+                          StartupContentPrefetcher.sameRecommendationOwner(owner, auth) else { return }
+                }
+                guard containsDismissalAnchor(item, in: response.sections) else { return }
                 response = SectionsResponse(sections: removal.mutate(response.sections))
             }
         } catch {
+            if let observation {
+                let current = await responseIsCurrent(observation)
+                guard current, generation == loadGeneration, !Task.isCancelled else { return }
+            }
             actionError = ErrorState(error)
+        }
+    }
+
+    private func containsDismissalAnchor(_ item: SectionItem, in observedSections: [ResolvedSection]? = nil) -> Bool {
+        (observedSections ?? sections).contains { section in
+            ["continue_watching", "in_progress", "next_up"].contains(section.sectionType) &&
+                section.items.contains { $0.contentId == item.contentId &&
+                    $0.progressUpdatedAt == item.progressUpdatedAt && $0.seriesId == item.seriesId }
         }
     }
 
@@ -324,59 +373,71 @@ class HomeViewModel {
     /// completed item from membership-driven Home rows. A fresh Home fetch
     /// reconciles replacement Next Up episodes and watched state elsewhere.
     @discardableResult
-    func setWatched(_ item: SectionItem, played: Bool) async -> Bool {
-        guard pendingWatchedUpdates.insert(item.contentId).inserted else {
-            return false
-        }
+    func setWatched(_ item: SectionItem, played: Bool, auth: CapturedOrdinaryRequestAuth?) async -> Bool {
+        guard let observation = displayedHomeResponse, observation.homeReadAuth == auth,
+              sections.contains(where: { $0.items.contains(item) }),
+              pendingWatchedUpdates.insert(item.contentId).inserted else { return false }
+        var generation = loadGeneration
         defer { pendingWatchedUpdates.remove(item.contentId) }
-
         actionError = nil
-
         do {
-            try await updateWatchedState(item.contentId, played)
-
-            // Never join or apply a Home request that began before this
-            // mutation. It can carry the old Next Up membership.
+            let current = await responseIsCurrent(observation)
+            guard current, generation == loadGeneration, !Task.isCancelled,
+                  sections.contains(where: { $0.items.contains(item) }) else { return false }
+            try await updateWatchedState(item.contentId, played, auth)
+            let mayPublish = await responseIsCurrent(observation)
+            guard mayPublish, generation == loadGeneration, !Task.isCancelled else { return false }
+            loadGeneration += 1
+            generation = loadGeneration
+            isLoading = false
+            isRefreshing = false
             StartupContentPrefetcher.invalidateHomeSectionsInFlight()
-
             if played {
-                sections = HomeSectionsMutation.removingCompletedItem(
-                    contentId: item.contentId,
-                    from: sections
-                )
-                ResponseCache.shared.update(CacheKey.homeSections, as: SectionsResponse.self) { response in
-                    response = SectionsResponse(
-                        sections: HomeSectionsMutation.removingCompletedItem(
-                            contentId: item.contentId,
-                            from: response.sections
-                        )
-                    )
-                }
+                sections = HomeSectionsMutation.removingCompletedItem(contentId: item.contentId, from: sections)
             }
+            let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+            if cached?.homeReadAuth == auth { ResponseCache.shared.remove(CacheKey.homeSections) }
 
-            // The server may advance a series to its following episode. Keep
-            // the local removal if this reconciliation cannot be fetched.
-            await loadSections()
+            // Preserve the accepted local change if reconciliation fails; the
+            // follow-up read must carry the write's original owner.
+            let refreshed = try? await reconcileHomeSections(auth)
+            let stillCurrent = await responseIsCurrent(observation)
+            guard stillCurrent, generation == loadGeneration, !Task.isCancelled else { return false }
+            if let refreshed {
+                let authorized = await responseIsCurrent(refreshed)
+                guard authorized, refreshed.homeReadAuth == auth,
+                      generation == loadGeneration, !Task.isCancelled else { return false }
+                sections = refreshed.sections.filter { !$0.items.isEmpty }
+                displayedHomeResponse = refreshed
+                error = nil
+            }
             return true
         } catch {
+            let current = await responseIsCurrent(observation)
+            guard current, generation == loadGeneration, !Task.isCancelled else { return false }
             actionError = ErrorState(error)
             return false
         }
     }
 
-    private func fetchAndApplySections() async throws {
+    private func fetchAndApplySections(generation: Int) async throws {
         let response = try await fetchHomeSections()
+        let current = await responseIsCurrent(response)
+        guard generation == loadGeneration, !Task.isCancelled else { throw CancellationError() }
+        guard current else { sections = []; throw HTTPError.requestIdentityChanged }
         sections = response.sections.filter { !$0.items.isEmpty }
+        displayedHomeResponse = response
         error = nil
     }
 
-    private func retryTransientInitialLoad() async {
+    private func retryTransientInitialLoad(generation: Int) async {
         try? await Task.sleep(nanoseconds: 750_000_000)
-        guard !Task.isCancelled else { return }
+        guard generation == loadGeneration, !Task.isCancelled else { return }
 
         do {
-            try await fetchAndApplySections()
+            try await fetchAndApplySections(generation: generation)
         } catch {
+            guard generation == loadGeneration, !Task.isCancelled else { return }
             self.error = ErrorState(error)
         }
     }

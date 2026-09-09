@@ -60,6 +60,17 @@ struct ContentView: View {
         // to the same auth state. Re-key the routed subtree so profile, home,
         // library, focus, and modal state cannot survive from the old server.
         .id(serverRegistry.activeServerId)
+        .safeAreaInset(edge: .top) {
+            if router.authState == .authenticated && !PlaybackStopNotices.shared.pending.isEmpty {
+                HStack {
+                    Text("A playback request is still pending.")
+                    Button("Retry") { Task { await PlaybackMutationCoordinator.shared.retryPendingStops() } }
+                }
+                .font(.callout)
+                .padding()
+                .frame(maxWidth: .infinity)
+            }
+        }
         .environment(audioStore)
         #if os(iOS)
         .environment(siloControl)
@@ -100,6 +111,12 @@ struct ContentView: View {
         }
         .onAppear {
             drainIncomingDeepLink()
+            // Reachability recovery edge for a sticky update-required verdict
+            // (see `ConnectionMonitor.onContractRecheckNeeded`). Idempotent,
+            // so repeated appearances just reinstall the same closure.
+            ConnectionMonitor.shared.onContractRecheckNeeded = {
+                Task { await AuthService.shared.refreshActiveServerName() }
+            }
             #if os(iOS) || os(tvOS)
             // The first frame SwiftUI actually produced. A launch whose
             // breadcrumbs stop at `process_start` never got here, which
@@ -204,6 +221,7 @@ struct ContentView: View {
         }
         #endif
         .task(id: router.authState) {
+            if router.authState == .authenticated { await PlaybackMutationCoordinator.shared.restorePending() }
             if router.authState != .authenticated {
                 playDeepLinkTask?.cancel()
                 playDeepLinkTask = nil
@@ -309,6 +327,7 @@ struct ContentView: View {
             }
         }
         .task(id: serverRegistry.activeProfileId) {
+            if router.authState == .authenticated { await PlaybackMutationCoordinator.shared.restorePending() }
             #if os(iOS) || os(tvOS)
             diagnosticsModel.reset()
             #endif
@@ -351,6 +370,16 @@ struct ContentView: View {
                 break
             }
             #endif
+
+            // Foreground recovery edge for a sticky update-required verdict
+            // (see `ConnectionMonitor.onContractRecheckNeeded`): a server
+            // upgraded while the app was backgrounded never trips the
+            // reachability edge, so re-probe here on every platform.
+            // `refreshActiveServerName` carries the server-identity checks
+            // and a failed probe leaves the verdict untouched.
+            if newPhase == .active, ConnectionMonitor.shared.isServerUpdateRequired {
+                Task { await AuthService.shared.refreshActiveServerName() }
+            }
 
             if newPhase == .background {
                 markProfileAwayStartIfNeeded()
@@ -907,7 +936,10 @@ struct ContentView: View {
         didAttemptDebugAutoPlay = true
 
         do {
-            let sections = try await SiloAPI.shared.homeSections()
+            let auth = await TokenStore.shared.captureOrdinaryRequestAuth()
+            let sections = try await SiloAPI.shared.homeSections(auth: auth)
+            let current = await StartupContentPrefetcher.homeResponseIsCurrent(sections)
+            guard current, !Task.isCancelled else { return }
             guard let contentId = sections.sections.lazy
                 .compactMap({ $0.items.first?.contentId })
                 .first else {
@@ -999,12 +1031,10 @@ struct ContentView: View {
         }
     }
     private func resolveDebugSearchContentId(query: String) async throws -> String {
-        let response = try await SiloAPI.shared.catalog(query: [
-            "source": "query",
-            "q": query,
-            "limit": "20",
-            "offset": "0",
-        ])
+        var catalogQuery = APIv2CatalogQuery()
+        catalogQuery.q = query
+        catalogQuery.limit = 20
+        let response = try await SiloAPI.shared.catalogPage(query: catalogQuery).value
 
         let normalizedQuery = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         let preferredItem = response.items.first { item in

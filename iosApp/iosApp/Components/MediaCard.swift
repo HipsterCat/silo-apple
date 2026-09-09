@@ -102,6 +102,23 @@ struct MediaCard: View {
 
     @State private var playedOverride: Bool?
     @State private var favoriteOverride: Bool?
+    @Environment(\.libraryCardAuthority) private var libraryOwner
+    @State private var libraryFavoriteRun: UUID?
+    @State private var libraryFavoritePending = false
+    @State private var libraryWatchlistRun: UUID?
+    @State private var libraryWatchlistPending = false
+    @Environment(\.isHomePersonalListSurface) private var isHomeSurface
+    @Environment(\.homePersonalListAuth) private var homeOwner
+    @State private var homeFavoriteRun: UUID?
+    @State private var homeFavoritePending = false
+    @State private var homeWatchlistRun: UUID?
+    @State private var homeWatchlistPending = false
+    @State private var catalogActionRun: UUID?
+    @Environment(\.catalogMembershipModel) private var catalogModel
+    @State private var searchActionRun: UUID?
+    @Environment(\.catalogSearchModel) private var searchModel
+    @Environment(\.savedPersonalListModel) private var savedList
+    @State private var savedListActionRun: UUID?
     @State private var watchlistOverride: Bool?
     @State private var uiCustomization = UICustomizationPreferences.shared
     @EnvironmentObject private var overlayStore: OverlayPrefsStore
@@ -169,7 +186,26 @@ struct MediaCard: View {
         ) {
             posterImage
         }
+        .onChange(of: contentId) { _, _ in resetLibraryPersonalActions(); resetHomePersonalActions(); resetSavedListAction(); resetSearchAction() }
+        .onChange(of: catalogModel?.displayedRead) { _, _ in resetCatalogAction() }
+        .onChange(of: catalogModel?.cardGeneration) { _, _ in resetCatalogAction() }
+        .onChange(of: catalogModel.map { ObjectIdentifier($0) }) { _, _ in resetCatalogAction() }
+        .onChange(of: contentId) { _, _ in resetCatalogAction() }
+        .onDisappear { if catalogModel != nil { resetCatalogAction() } }
+        .onChange(of: searchModel?.displayedRead) { _, _ in resetSearchAction() }
+        .onChange(of: searchModel?.cardGeneration) { _, _ in resetSearchAction() }
+        .onChange(of: searchModel.map { ObjectIdentifier($0) }) { _, _ in resetSearchAction() }
+        .onDisappear { if searchModel != nil { resetSearchAction() } }
+        .onChange(of: savedList?.cardGeneration) { _, _ in resetSavedListAction() }
+        .onChange(of: savedList?.displayedAuth) { _, _ in resetSavedListAction() }
+        .onChange(of: homeOwner) { _, _ in resetHomePersonalActions() }
+        .onChange(of: isHomeSurface) { _, _ in resetHomePersonalActions() }
+        .onChange(of: libraryOwner) { _, _ in resetLibraryPersonalActions() }
         .onChange(of: userState) { _, _ in
+            resetLibraryPersonalActions()
+            resetHomePersonalActions()
+            resetSavedListAction()
+            resetSearchAction()
             playedOverride = nil
             favoriteOverride = nil
             watchlistOverride = nil
@@ -184,7 +220,26 @@ struct MediaCard: View {
                 iosCardButton
             }
         }
+        .onChange(of: contentId) { _, _ in resetLibraryPersonalActions(); resetHomePersonalActions(); resetSavedListAction(); resetSearchAction() }
+        .onChange(of: catalogModel?.displayedRead) { _, _ in resetCatalogAction() }
+        .onChange(of: catalogModel?.cardGeneration) { _, _ in resetCatalogAction() }
+        .onChange(of: catalogModel.map { ObjectIdentifier($0) }) { _, _ in resetCatalogAction() }
+        .onChange(of: contentId) { _, _ in resetCatalogAction() }
+        .onDisappear { if catalogModel != nil { resetCatalogAction() } }
+        .onChange(of: searchModel?.displayedRead) { _, _ in resetSearchAction() }
+        .onChange(of: searchModel?.cardGeneration) { _, _ in resetSearchAction() }
+        .onChange(of: searchModel.map { ObjectIdentifier($0) }) { _, _ in resetSearchAction() }
+        .onDisappear { if searchModel != nil { resetSearchAction() } }
+        .onChange(of: savedList?.cardGeneration) { _, _ in resetSavedListAction() }
+        .onChange(of: savedList?.displayedAuth) { _, _ in resetSavedListAction() }
+        .onChange(of: homeOwner) { _, _ in resetHomePersonalActions() }
+        .onChange(of: isHomeSurface) { _, _ in resetHomePersonalActions() }
+        .onChange(of: libraryOwner) { _, _ in resetLibraryPersonalActions() }
         .onChange(of: userState) { _, _ in
+            resetLibraryPersonalActions()
+            resetHomePersonalActions()
+            resetSavedListAction()
+            resetSearchAction()
             playedOverride = nil
             favoriteOverride = nil
             watchlistOverride = nil
@@ -265,7 +320,9 @@ struct MediaCard: View {
     /// user state) get the favorite/watchlist menu — thumbnails without
     /// user state (people, collections, discover results) don't.
     private var hasPersonalActions: Bool {
-        contentId != nil && userState != nil
+        contentId != nil && userState != nil && (catalogModel?.displayedRead != nil
+            || searchModel?.displayedRead != nil || savedList?.displayedAuth != nil
+            || (isHomeSurface && homeOwner != nil) || libraryOwner?.auth != nil)
     }
 
     private var isFavorite: Bool {
@@ -286,38 +343,212 @@ struct MediaCard: View {
     }
 
     private func togglePersonalFavorite() {
+        if let catalogModel { toggleCatalogMembership(.favorites, model: catalogModel); return }
+        if let searchModel { toggleSearchMembership(.favorites, model: searchModel); return }
         guard let contentId else { return }
-        let newValue = !isFavorite
-        let watchlist = isInWatchlist
-        favoriteOverride = newValue
-        Task {
-            if await PersonalListSync.setFavorite(
-                contentId: contentId, isFavorite: newValue, inWatchlist: watchlist
-            ) {
-                onUserStateChanged?(
-                    MediaItemUserState(played: isPlayed, isFavorite: newValue, inWatchlist: watchlist)
-                )
-            } else {
-                favoriteOverride = !newValue // Revert on failure
+        if let savedList {
+            toggleSavedList(contentId: contentId, target: .favorites, included: !isFavorite, model: savedList)
+            return
+        }
+        if isHomeSurface {
+            toggleHomeFavorite(contentId: contentId)
+            return
+        }
+        if let owner = libraryOwner {
+            toggleLibraryFavorite(contentId: contentId, owner: owner)
+            return
+        }
+    }
+
+    private func resetSearchAction() {
+        searchActionRun = nil
+        favoriteOverride = nil
+        watchlistOverride = nil
+    }
+
+    private func resetCatalogAction() {
+        catalogActionRun = nil
+        favoriteOverride = nil
+        watchlistOverride = nil
+    }
+
+    private func toggleCatalogMembership(_ target: APIv2PersonalListKind, model: any CatalogMembershipModel) {
+        guard let contentId, catalogActionRun == nil else { return }
+        let included = target == .favorites ? !isFavorite : !isInWatchlist
+        guard let action = model.prepareCardAction(contentId: contentId, target: target, included: included) else { return }
+        catalogActionRun = action.id
+        if target == .favorites { favoriteOverride = included } else { watchlistOverride = included }
+        Task { @MainActor in
+            let result = await model.performCardAction(action)
+            guard catalogActionRun == action.id, catalogModel === model, self.contentId == contentId else { return }
+            catalogActionRun = nil
+            if result != true {
+                if target == .favorites { favoriteOverride = nil } else { watchlistOverride = nil }
             }
         }
     }
 
-    private func togglePersonalWatchlist() {
-        guard let contentId else { return }
-        let newValue = !isInWatchlist
-        let favorite = isFavorite
-        watchlistOverride = newValue
-        Task {
-            if await PersonalListSync.setWatchlist(
-                contentId: contentId, isFavorite: favorite, inWatchlist: newValue
-            ) {
-                onUserStateChanged?(
-                    MediaItemUserState(played: isPlayed, isFavorite: favorite, inWatchlist: newValue)
-                )
-            } else {
-                watchlistOverride = !newValue // Revert on failure
+    private func toggleSearchMembership(_ target: APIv2PersonalListKind, model: SearchViewModel) {
+        guard let contentId, searchActionRun == nil else { return }
+        let included = target == .favorites ? !isFavorite : !isInWatchlist
+        guard let action = model.prepareCardAction(contentId: contentId, target: target, included: included) else { return }
+        searchActionRun = action.id
+        if target == .favorites { favoriteOverride = included } else { watchlistOverride = included }
+        Task { @MainActor in
+            let result = await model.performCardAction(action)
+            guard searchActionRun == action.id, searchModel === model, self.contentId == contentId else { return }
+            searchActionRun = nil
+            if result != true {
+                if target == .favorites { favoriteOverride = nil } else { watchlistOverride = nil }
             }
+        }
+    }
+
+    private func resetSavedListAction() {
+        savedListActionRun = nil
+        favoriteOverride = nil
+        watchlistOverride = nil
+    }
+
+    private func toggleSavedList(contentId: String, target: APIv2PersonalListKind,
+                                 included: Bool, model: PersonalListViewModel) {
+        guard let action = model.prepareCardAction(contentId: contentId, target: target, included: included) else { return }
+        let oldOverride = target == .favorites ? favoriteOverride : watchlistOverride
+        savedListActionRun = action.id
+        if target == .favorites { favoriteOverride = included } else { watchlistOverride = included }
+        Task { @MainActor in
+            let result = await model.performCardAction(action)
+            guard savedListActionRun == action.id, savedList === model,
+                  self.contentId == contentId, model.cardGeneration == action.generation,
+                  model.displayedAuth == action.auth, !Task.isCancelled else { return }
+            savedListActionRun = nil
+            // Successful receipts already update/remove the model's item and
+            // cache. Do not invoke an unscoped second removal callback.
+            if result == false {
+                if target == .favorites { favoriteOverride = oldOverride } else { watchlistOverride = oldOverride }
+            } else {
+                if target == .favorites { favoriteOverride = nil } else { watchlistOverride = nil }
+            }
+        }
+    }
+
+    private func resetHomePersonalActions() {
+        homeFavoriteRun = nil
+        favoriteOverride = nil
+        homeWatchlistRun = nil
+        watchlistOverride = nil
+    }
+
+    private func toggleHomeFavorite(contentId: String) {
+        guard !homeFavoritePending, let auth = homeOwner else { return }
+        let run = UUID()
+        let oldOverride = favoriteOverride
+        let desired = !isFavorite
+        homeFavoriteRun = run
+        homeFavoritePending = true
+        favoriteOverride = desired
+        Task { @MainActor in
+            defer { homeFavoritePending = false }
+            let success = await PersonalListSync.setHomeFavorite(contentId: contentId, isFavorite: desired, auth: auth)
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard homeFavoriteRun == run, self.contentId == contentId, isHomeSurface, homeOwner == auth,
+                  !Task.isCancelled else { return }
+            homeFavoriteRun = nil
+            guard current else { favoriteOverride = nil; return }
+            if success {
+                onUserStateChanged?(MediaItemUserState(played: isPlayed, isFavorite: desired, inWatchlist: isInWatchlist))
+            } else { favoriteOverride = oldOverride }
+        }
+    }
+
+    private func toggleHomeWatchlist(contentId: String) {
+        guard !homeWatchlistPending, let auth = homeOwner else { return }
+        let run = UUID()
+        let oldOverride = watchlistOverride
+        let desired = !isInWatchlist
+        homeWatchlistRun = run
+        homeWatchlistPending = true
+        watchlistOverride = desired
+        Task { @MainActor in
+            defer { homeWatchlistPending = false }
+            let success = await PersonalListSync.setHomeWatchlist(contentId: contentId, inWatchlist: desired, auth: auth)
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard homeWatchlistRun == run, self.contentId == contentId, isHomeSurface, homeOwner == auth,
+                  !Task.isCancelled else { return }
+            homeWatchlistRun = nil
+            guard current else { watchlistOverride = nil; return }
+            if success {
+                onUserStateChanged?(MediaItemUserState(played: isPlayed, isFavorite: isFavorite, inWatchlist: desired))
+            } else { watchlistOverride = oldOverride }
+        }
+    }
+
+    private func resetLibraryPersonalActions() {
+        libraryFavoriteRun = nil
+        favoriteOverride = nil
+        libraryWatchlistRun = nil
+        watchlistOverride = nil
+    }
+
+    private func toggleLibraryFavorite(contentId: String, owner: LibraryCardAuthority) {
+        guard !libraryFavoritePending, let auth = owner.auth else { return }
+        let run = UUID()
+        let oldOverride = favoriteOverride
+        let desired = !isFavorite
+        libraryFavoriteRun = run
+        libraryFavoritePending = true
+        favoriteOverride = desired
+        Task { @MainActor in
+            defer { libraryFavoritePending = false }
+            let success = await PersonalListSync.setLibraryFavorite(contentId: contentId, isFavorite: desired, owner: owner)
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard libraryFavoriteRun == run, self.contentId == contentId, libraryOwner == owner,
+                  !Task.isCancelled else { return }
+            libraryFavoriteRun = nil
+            guard current else { favoriteOverride = nil; return }
+            if success {
+                onUserStateChanged?(MediaItemUserState(played: isPlayed, isFavorite: desired, inWatchlist: isInWatchlist))
+            } else { favoriteOverride = oldOverride }
+        }
+    }
+
+    private func toggleLibraryWatchlist(contentId: String, owner: LibraryCardAuthority) {
+        guard !libraryWatchlistPending, let auth = owner.auth else { return }
+        let run = UUID()
+        let oldOverride = watchlistOverride
+        let desired = !isInWatchlist
+        libraryWatchlistRun = run
+        libraryWatchlistPending = true
+        watchlistOverride = desired
+        Task { @MainActor in
+            defer { libraryWatchlistPending = false }
+            let success = await PersonalListSync.setLibraryWatchlist(contentId: contentId, inWatchlist: desired, owner: owner)
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard libraryWatchlistRun == run, self.contentId == contentId, libraryOwner == owner,
+                  !Task.isCancelled else { return }
+            libraryWatchlistRun = nil
+            guard current else { watchlistOverride = nil; return }
+            if success {
+                onUserStateChanged?(MediaItemUserState(played: isPlayed, isFavorite: isFavorite, inWatchlist: desired))
+            } else { watchlistOverride = oldOverride }
+        }
+    }
+
+    private func togglePersonalWatchlist() {
+        if let catalogModel { toggleCatalogMembership(.watchlist, model: catalogModel); return }
+        if let searchModel { toggleSearchMembership(.watchlist, model: searchModel); return }
+        guard let contentId else { return }
+        if let savedList {
+            toggleSavedList(contentId: contentId, target: .watchlist, included: !isInWatchlist, model: savedList)
+            return
+        }
+        if isHomeSurface {
+            toggleHomeWatchlist(contentId: contentId)
+            return
+        }
+        if let owner = libraryOwner {
+            toggleLibraryWatchlist(contentId: contentId, owner: owner)
+            return
         }
     }
 

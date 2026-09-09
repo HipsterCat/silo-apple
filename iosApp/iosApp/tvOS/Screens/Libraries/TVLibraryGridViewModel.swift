@@ -1,4 +1,3 @@
-#if os(tvOS)
 import Foundation
 import Observation
 import Nuke
@@ -9,8 +8,7 @@ import Nuke
 ///
 /// Key differences from iOS:
 ///
-/// - **Pagination** uses the server's snapshot timestamp (`snapshot_at`) as a
-///   fence so pages stay coherent even if items are being ingested mid-scroll.
+/// - **Pagination** follows server-issued cursors pinned to the active viewer.
 /// - **Page size** is 100 (the server's hard cap) instead of 60.
 /// - **Prefetch trigger** fires earlier (more lead rows) and warms posters via
 ///   Nuke.
@@ -32,6 +30,96 @@ final class TVLibraryGridViewModel {
 
     // MARK: - Private state
 
+    struct DisplayedRead: Equatable {
+        let libraryId: Int
+        let filterKey: String
+        let auth: CapturedOrdinaryRequestAuth
+    }
+
+    struct CardAction {
+        let id: UUID
+        let contentId: String
+        let target: APIv2PersonalListKind
+        let included: Bool
+        let owner: DisplayedRead
+        let generation: Int
+    }
+
+    private(set) var cardGeneration = 0
+    private var pendingCardActions: [String: UUID] = [:]
+
+    /// Called synchronously by the rendered card before creating its Task.
+    func prepareCardAction(contentId: String, target: APIv2PersonalListKind,
+                           included: Bool, libraryId: Int) -> CardAction? {
+        guard let owner = displayedRead, owner.libraryId == libraryId,
+              owner.filterKey == filter.cacheKeyFragment,
+              pendingCardActions[contentId] == nil,
+              items.contains(where: { $0.contentId == contentId && $0.userState != nil }) else { return nil }
+        let action = CardAction(id: UUID(), contentId: contentId, target: target,
+            included: included, owner: owner, generation: cardGeneration)
+        pendingCardActions[contentId] = action.id
+        return action
+    }
+
+    private func cardActionIsCurrent(_ action: CardAction) -> Bool {
+        action.generation == cardGeneration && action.owner == displayedRead
+            && action.owner.filterKey == filter.cacheKeyFragment
+            && pendingCardActions[action.contentId] == action.id
+            && items.contains(where: { $0.contentId == action.contentId }) && !Task.isCancelled
+    }
+
+    /// nil denotes a stale action; false denotes a current failed send.
+    func performCardAction(_ action: CardAction) async -> Bool? {
+        defer {
+            if pendingCardActions[action.contentId] == action.id { pendingCardActions[action.contentId] = nil }
+        }
+        let current = await authorityCheck(action.owner.auth)
+        guard current, cardActionIsCurrent(action) else { return nil }
+        do {
+            switch action.target {
+            case .favorites:
+                try await api.v2.setFavoriteMembership(id: action.contentId, included: action.included, auth: action.owner.auth)
+            case .watchlist:
+                try await api.v2.setWatchlistMembership(id: action.contentId, included: action.included, auth: action.owner.auth)
+            }
+            let current = await authorityCheck(action.owner.auth)
+            guard current, cardActionIsCurrent(action) else { return nil }
+            // Older reads cannot overwrite this receipt. Other item actions
+            // from the same display and its opaque continuation stay valid.
+            generation += 1
+            isLoading = false
+            isRefreshing = false
+            if let index = items.firstIndex(where: { $0.contentId == action.contentId }) {
+                let old = items[index].userState
+                items[index].userState = MediaItemUserState(played: old?.played ?? false,
+                    isFavorite: action.target == .favorites ? action.included : old?.isFavorite ?? false,
+                    inWatchlist: action.target == .watchlist ? action.included : old?.inWatchlist ?? false)
+            }
+            ResponseCache.shared.remove(CacheKey.itemUserState(action.contentId))
+            ResponseCache.shared.remove(action.target == .favorites ? CacheKey.favorites : CacheKey.watchlist)
+            ResponseCache.shared.remove(CacheKey.homeSections)
+            let cached: CachedPage? = ResponseCache.shared.get(currentCacheKey)
+            if cached?.owner == action.owner { ResponseCache.shared.remove(currentCacheKey) }
+            let sectionsKey = CacheKey.librarySections(libraryId)
+            let sections: APIv2LibrarySectionsRead? = ResponseCache.shared.get(sectionsKey)
+            if sections?.auth == action.owner.auth { ResponseCache.shared.remove(sectionsKey) }
+            return true
+        } catch {
+            let current = await authorityCheck(action.owner.auth)
+            guard current, cardActionIsCurrent(action) else { return nil }
+            return false
+        }
+    }
+
+    private struct CachedPage {
+        let owner: DisplayedRead
+        let response: CatalogResponse
+    }
+
+    private(set) var displayedRead: DisplayedRead?
+    private let api: SiloAPI
+    private let tokens: TokenStore
+    private let authorityCheck: (CapturedOrdinaryRequestAuth) async -> Bool
     private let libraryId: Int
     /// Media family — picks the sort/facet vocabulary in the panels.
     let mediaType: BrowseMediaType
@@ -40,8 +128,7 @@ final class TVLibraryGridViewModel {
     private let sendsType: Bool
     private let pageSize: Int = 100
 
-    private var snapshot: String? = nil
-    private var nextOffset: Int = 0
+    private var continuation: APIv2CatalogContinuation?
     @ObservationIgnored private var prefetchedPosterURLs: Set<URL> = []
     @ObservationIgnored private var visiblePosterRows: [Int: Range<Int>] = [:]
     /// Decoded into the memory cache so a cell scrolling into view paints the
@@ -56,7 +143,12 @@ final class TVLibraryGridViewModel {
     )
     private var generation: Int = 0
 
-    init(libraryId: Int, libraryType: String, initialFilter: CatalogFilterState = .none) {
+    init(libraryId: Int, libraryType: String, initialFilter: CatalogFilterState = .none,
+         api: SiloAPI = .shared, tokens: TokenStore = .shared,
+         authorityCheck: ((CapturedOrdinaryRequestAuth) async -> Bool)? = nil) {
+        self.api = api
+        self.tokens = tokens
+        self.authorityCheck = authorityCheck ?? { await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: $0) != nil }
         self.libraryId = libraryId
         self.mediaType = BrowseMediaType.from(libraryType: libraryType)
         self.sendsType = SiloMediaType.isSeries(libraryType) || SiloMediaType.isMovieLibrary(libraryType)
@@ -70,22 +162,35 @@ final class TVLibraryGridViewModel {
             self.filter = initialFilter
         }
         facets = FacetLoader.shared.cachedFacets(libraryId: libraryId)
-        hydratePage1FromCache()
     }
 
     private var currentCacheKey: String {
         CacheKey.tvLibrary(libraryId: libraryId, filterKey: filter.cacheKeyFragment)
     }
 
-    private func hydratePage1FromCache() {
+    private func hydratePage1FromCache(owner: DisplayedRead) {
         guard items.isEmpty,
-              let cached: CatalogResponse = ResponseCache.shared.get(currentCacheKey) else {
-            return
-        }
-        items = cached.items
-        hasMore = cached.hasMore ?? false
-        nextOffset = cached.items.count
-        snapshot = cached.snapshot
+              let cached: CachedPage = ResponseCache.shared.get(currentCacheKey),
+              cached.owner == owner else { return }
+        items = cached.response.items
+        displayedRead = owner
+        hasMore = false
+    }
+
+    private func clearDisplayedRows() {
+        cardGeneration += 1
+        items = []
+        displayedRead = nil
+        continuation = nil
+        hasMore = false
+        cancelPosterPrefetch()
+    }
+
+    func cancel() {
+        generation += 1
+        clearDisplayedRows()
+        isLoading = false
+        isRefreshing = false
     }
 
     // MARK: - Public API
@@ -193,71 +298,92 @@ final class TVLibraryGridViewModel {
     // MARK: - Fetch logic
 
     private func reload() async {
-        // A cache-backed reload can preserve the grid's row identities and
-        // visibility. Cancel old URLs without discarding that geometry.
+        cardGeneration += 1
         stopPosterPrefetchRequests()
         generation += 1
-        items = []
-        nextOffset = 0
-        hasMore = true
-        snapshot = nil
+        continuation = nil
+        hasMore = false
         error = nil
-        hydratePage1FromCache()
-        refreshPosterPrefetch()
         await fetchPage(reset: true)
     }
 
     private func fetchPage(reset: Bool) async {
         let myGeneration = generation
-        if reset, !items.isEmpty {
-            isRefreshing = true
-        } else {
-            isLoading = true
-        }
+        let requestedFilter = filter
+        let filterKey = requestedFilter.cacheKeyFragment
+        let cacheKey = currentCacheKey
+        // Reserve paging before the first await; a second Load More cannot
+        // issue this continuation concurrently.
+        isLoading = true
+        isRefreshing = reset && !items.isEmpty
         defer {
-            isLoading = false
-            isRefreshing = false
+            if myGeneration == generation {
+                isLoading = false
+                isRefreshing = false
+            }
         }
-
-        let requestOffset = reset ? 0 : nextOffset
-        let requestSnapshot = reset ? nil : snapshot
-        let query = CatalogQueryBuilder.build(
-            filter,
-            libraryId: libraryId,
-            mediaType: mediaType,
-            offset: requestOffset,
-            limit: pageSize,
-            snapshot: requestSnapshot,
-            includeType: sendsType
-        )
-
+        let captured = await tokens.captureOrdinaryRequestAuth()
+        guard myGeneration == generation, !Task.isCancelled else { return }
+        guard let auth = captured, let profile = auth.profileId, !profile.isEmpty else {
+            clearDisplayedRows()
+            error = ErrorState(HTTPError.requestIdentityChanged)
+            return
+        }
+        let owner = DisplayedRead(libraryId: libraryId, filterKey: filterKey, auth: auth)
+        if displayedRead != owner {
+            clearDisplayedRows()
+            if !reset {
+                error = ErrorState(HTTPError.requestIdentityChanged)
+                return
+            }
+        }
+        if reset {
+            let current = await authorityCheck(auth)
+            guard myGeneration == generation, !Task.isCancelled else { return }
+            guard current else {
+                clearDisplayedRows()
+                error = ErrorState(HTTPError.requestIdentityChanged)
+                return
+            }
+            hydratePage1FromCache(owner: owner)
+            refreshPosterPrefetch()
+        }
+        let cursor = continuation
         do {
-            let response: CatalogResponse = try await SiloAPI.shared.catalog(
-                query: query
-            )
-
-            // Discard if another reload superseded us while we awaited.
-            guard myGeneration == generation else { return }
-
+            let result: APIv2CatalogResult
+            if !reset {
+                guard let cursor, cursor.auth == auth else { throw HTTPError.requestIdentityChanged }
+                result = try await api.v2.nextCatalogPage(cursor)
+            } else {
+                let query = CatalogQueryBuilder.build(requestedFilter, libraryId: libraryId, mediaType: mediaType, limit: pageSize, includeType: sendsType)
+                result = try await api.catalogPage(query: query, auth: auth)
+            }
+            let current = await authorityCheck(auth)
+            guard myGeneration == generation, !Task.isCancelled else { return }
+            guard current, result.auth == auth else { throw HTTPError.requestIdentityChanged }
+            let response = CatalogResponse(catalogPage: result.value)
             if reset {
                 items = response.items
-                ResponseCache.shared.set(response, for: currentCacheKey)
-                nextOffset = response.items.count
-                snapshot = response.snapshot
+                ResponseCache.shared.set(CachedPage(owner: owner, response: response), for: cacheKey)
             } else {
                 items.append(contentsOf: response.items)
-                nextOffset += response.items.count
-                if snapshot == nil { snapshot = response.snapshot }
             }
-            hasMore = response.hasMore ?? false
+            displayedRead = owner
+            continuation = result.continuation
+            hasMore = result.continuation != nil
+            error = nil
             refreshPosterPrefetch()
         } catch {
-            guard myGeneration == generation else { return }
-            if items.isEmpty {
-                self.error = ErrorState(error)
-            }
+            guard myGeneration == generation, !Task.isCancelled else { return }
+            let current = await authorityCheck(auth)
+            guard myGeneration == generation, !Task.isCancelled else { return }
+            if !current { clearDisplayedRows() }
+            self.error = ErrorState(current ? error : HTTPError.requestIdentityChanged)
+            continuation = nil
+            hasMore = false
         }
     }
+
 }
 
 // MARK: - Safe subscript
@@ -270,4 +396,3 @@ private extension Array {
         return self[lower..<upper]
     }
 }
-#endif

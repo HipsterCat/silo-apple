@@ -1,6 +1,6 @@
 import Foundation
 
-/// Server setup status from /api/v1/auth/setup.
+/// Server setup status (from `GET /api/v2/system/setup` via `APIv2Client`).
 struct SetupStatus: Codable {
     let needsSetup: Bool
 }
@@ -18,10 +18,10 @@ struct HealthStatus: Codable {
     let serverId: String?
 }
 
-/// Public native identity from GET /api/v1/theme/branding.
+/// Public native identity from GET /api/v2/theme/branding (with legacy fallback).
 ///
-/// The endpoint predates native multi-server clients, so only the server name
-/// is required here. Additional white-label fields remain forward-compatible.
+/// Native clients consume only the name. Optional v2 asset URLs and web styling
+/// fields are ignored, so absent artwork does not affect server identity.
 struct ServerBrandingStatus: Codable {
     let serverName: String?
 }

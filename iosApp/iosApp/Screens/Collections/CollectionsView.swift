@@ -46,6 +46,7 @@ struct CollectionsView: View {
                     Image(systemName: "folder.badge.plus")
                         .foregroundColor(.siloPrimary)
                 }
+                .disabled(!viewModel.supportsGroups)
             }
             ToolbarItem {
                 Button {
@@ -63,6 +64,7 @@ struct CollectionsView: View {
                     Image(systemName: "folder.badge.plus")
                         .foregroundColor(.siloPrimary)
                 }
+                .disabled(!viewModel.supportsGroups)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -106,7 +108,7 @@ struct CollectionsView: View {
                                 #if !os(tvOS)
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                     Button(role: .destructive) {
-                                        Task { await viewModel.deleteCollection(id: collection.id) }
+                                        viewModel.pendingGroupAction = .deleteCollection(collection)
                                     } label: {
                                         Label("Delete", systemImage: "trash")
                                     }
@@ -116,6 +118,7 @@ struct CollectionsView: View {
                                         Label("Move", systemImage: "folder")
                                     }
                                     .tint(.siloPrimary)
+                                    .disabled(!viewModel.supportsGroups)
                                 }
                                 #endif
                         }
@@ -140,7 +143,7 @@ struct CollectionsView: View {
                 .font(.siloCaption)
                 .foregroundColor(.siloSecondaryText)
             Spacer()
-            if let groupId = section.groupId,
+            if viewModel.supportsGroups, let groupId = section.groupId,
                let group = viewModel.groups.first(where: { $0.id == groupId }) {
                 Menu {
                     Button {
@@ -263,6 +266,7 @@ private struct GroupActionSheet: View {
             default: break
             }
         }
+        .task(id: action.id) { await viewModel.reloadEditor() }
     }
 
     @ViewBuilder
@@ -286,6 +290,16 @@ private struct GroupActionSheet: View {
             }
             .padding(SiloTheme.padding)
             .navigationTitle("Delete group")
+        case .deleteCollection(let collection):
+            VStack(spacing: SiloTheme.padding) {
+                Text("Delete “\(collection.name)”?")
+                    .font(.siloTitle)
+                Text("This cannot be undone.").foregroundStyle(Color.siloSecondaryText)
+                errorBanner
+                Spacer()
+            }
+            .padding(SiloTheme.padding)
+            .navigationTitle("Delete collection")
         case .move(let collection):
             VStack(spacing: 0) {
                 List {
@@ -333,11 +347,16 @@ private struct GroupActionSheet: View {
 
     @ViewBuilder
     private var errorBanner: some View {
+        if let currentName = viewModel.editorCurrentName {
+            Text("Current name: \(currentName)").font(.siloCaption)
+        }
         if let message = viewModel.groupError {
             Text(message)
                 .font(.siloCaption)
                 .foregroundColor(.siloError)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Reload current version") { Task { await viewModel.reloadEditor() } }
+                .disabled(viewModel.isSaving)
         }
     }
 
@@ -358,16 +377,19 @@ private struct GroupActionSheet: View {
         switch action {
         case .create: return "Create"
         case .rename: return "Save"
-        case .delete: return "Delete"
+        case .delete, .deleteCollection: return "Delete"
         case .move: return "Move"
         }
     }
 
     private var canConfirm: Bool {
+        guard !viewModel.isSaving, !viewModel.editorNeedsReload else { return false }
+        if case .create = action { return viewModel.supportsGroups && !name.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard viewModel.editorVersion != nil else { return false }
         switch action {
         case .create, .rename:
             return !name.trimmingCharacters(in: .whitespaces).isEmpty
-        case .delete, .move:
+        case .delete, .move, .deleteCollection:
             return true
         }
     }
@@ -380,6 +402,8 @@ private struct GroupActionSheet: View {
             await viewModel.renameGroup(id: group.id, name: name)
         case .delete(let group):
             await viewModel.deleteGroup(id: group.id)
+        case .deleteCollection(let collection):
+            await viewModel.deleteCollection(id: collection.id)
         case .move(let collection):
             await viewModel.moveCollection(id: collection.id, toGroupId: pendingMoveTarget)
         }
@@ -636,13 +660,12 @@ struct LibraryCollectionDetailView: View {
     let title: String?
     let kind: LibraryCollectionKind?
 
-    @State private var items: [BrowseItem] = []
-    @State private var isLoading = false
-    @State private var error: ErrorState?
-    @State private var hasMore = true
-    @State private var totalItems: Int?
-    @State private var nextOffset = 0
-    @State private var snapshot: String?
+    @State private var viewModel = CollectionDetailViewModel()
+    private var items: [BrowseItem] { viewModel.items }
+    private var isLoading: Bool { viewModel.isLoading }
+    private var error: ErrorState? { viewModel.membership.error ?? viewModel.error }
+    private var hasMore: Bool { viewModel.hasMore }
+    private var totalItems: Int? { viewModel.totalItems }
 
     @Environment(AppRouter.self) private var router
 
@@ -664,6 +687,7 @@ struct LibraryCollectionDetailView: View {
                 )
             }
         }
+        .environment(\.catalogMembershipModel, viewModel.membership)
         .siloPageBackground()
         .navigationTitle(title ?? "Collection")
         .siloNavigationTitleDisplayMode(.large)
@@ -678,6 +702,10 @@ struct LibraryCollectionDetailView: View {
     private var content: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: SiloTheme.padding) {
+                if let error {
+                    Text(error.message).foregroundColor(.siloError)
+                    Button("Reload collection") { Task { await loadItems(reset: true) } }
+                }
                 Text(countLabel)
                     .font(.siloCaption)
                     .foregroundColor(.siloSecondaryText)
@@ -705,7 +733,7 @@ struct LibraryCollectionDetailView: View {
         if let totalItems, !hasMore {
             return "\(totalItems) item\(totalItems == 1 ? "" : "s")"
         }
-        let suffix = hasMore ? "+" : ""
+        let suffix = hasMore || error != nil ? "+" : ""
         return "\(items.count)\(suffix) item\(items.count == 1 && !hasMore ? "" : "s")"
     }
 
@@ -715,68 +743,11 @@ struct LibraryCollectionDetailView: View {
     }
 
     private func loadItems(reset: Bool) async {
-        guard !isLoading else { return }
-        if reset {
-            // Surface the cached page-1 snapshot instantly so the grid
-            // doesn't blank out while the network call runs.
-            if items.isEmpty,
-               let cached: CatalogResponse = ResponseCache.shared.get(
-                   CacheKey.collectionItems(collectionId)
-               ) {
-                items = cached.items
-                hasMore = cached.hasMore ?? false
-                totalItems = cached.totalExact == false ? nil : cached.total
-                nextOffset = cached.items.count
-                snapshot = cached.snapshot
-            } else {
-                items = []
-                hasMore = true
-                totalItems = nil
-                nextOffset = 0
-                snapshot = nil
-            }
-        }
-        guard hasMore else { return }
-
-        isLoading = true
-        error = nil
-
-        do {
-            let response: CatalogResponse
-            if kind == .userCollections {
-                response = try await SiloAPI.shared.userCollectionItems(
-                    collectionId: collectionId,
-                    offset: nextOffset,
-                    limit: pageSize,
-                    snapshot: snapshot
-                )
-            } else {
-                response = try await SiloAPI.shared.libraryCollectionItems(
-                    libraryId: libraryId,
-                    collectionId: collectionId,
-                    offset: nextOffset,
-                    limit: pageSize,
-                    snapshot: snapshot
-                )
-            }
-            if reset {
-                items = response.items
-                ResponseCache.shared.set(response, for: CacheKey.collectionItems(collectionId))
-            } else {
-                items.append(contentsOf: response.items)
-            }
-            totalItems = response.totalExact == false ? nil : response.total
-            hasMore = response.hasMore ?? false
-            nextOffset += response.items.count
-            if snapshot == nil {
-                snapshot = response.snapshot
-            }
-        } catch let err {
-            if items.isEmpty {
-                error = ErrorState(err)
-            }
-        }
-
-        isLoading = false
+        var query = APIv2CatalogQuery()
+        query.source = (kind ?? .regular).catalogSource
+        query.collectionId = collectionId
+        if kind != .userCollections { query.libraryId = String(libraryId) }
+        query.limit = min(pageSize, 100)
+        await viewModel.loadCatalog(query: query, reset: reset)
     }
 }

@@ -14,17 +14,13 @@ struct ServerIdentityResolver {
     }
 
     func fetchServerName(serverURL: String) async -> String? {
+        // Discovery uses only the explicit candidate URL before login.
         do {
             let branding: ServerBrandingStatus = try await httpClient.getUnauthenticated(
-                serverURL: serverURL,
-                path: "/api/v1/theme/branding",
-                quietStatuses: [404]
-            )
-            if let name = Self.usableName(branding.serverName) {
-                return name
-            }
+                serverURL: serverURL, path: "/api/v2/theme/branding", quietStatuses: [404])
+            if let name = Self.usableName(branding.serverName) { return name }
         } catch HTTPError.http(let statusCode, _) where statusCode == 404 {
-            // Older servers do not expose native branding.
+            // Health remains the deliberately retained discovery endpoint.
         } catch {
             return nil
         }

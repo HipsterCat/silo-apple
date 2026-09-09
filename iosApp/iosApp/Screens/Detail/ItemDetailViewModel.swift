@@ -168,6 +168,10 @@ class ItemDetailViewModel {
     /// mutation. Without this, a slow entry load can overwrite an optimistic
     /// button tap and put the stale pair back into `ResponseCache`.
     private var userStateMutationGeneration = 0
+    private var watchlistMutationPending = false
+    private var favoriteMutationPending = false
+    private var watchedMutationPending = false
+    private var pendingEpisodeFavorites: Set<String> = []
 
     // tvOS pre-play selector state. ItemDetailCache retains this view model
     // while the user enters playback or navigates to another item, so manual
@@ -193,6 +197,9 @@ class ItemDetailViewModel {
     ///   the preferred initial season would yank the ground out from under
     ///   the user — under focus, on tvOS. Entry loads and the player-dismiss
     ///   reload leave it false: there, re-picking the season is the point.
+    private(set) var trackPreferenceAuth: CapturedOrdinaryRequestAuth?
+    private var didCaptureTrackPreferenceAuth = false
+
     func loadDetail(
         contentId: String,
         preserveSeasonSelection: Bool = false,
@@ -215,6 +222,18 @@ class ItemDetailViewModel {
             episodesLoadFailed = false
             isLoadingEpisodes = false
         }
+        // Pin this screen's owner before exposing selectable detail. Refreshes
+        // must not rebind existing selectors to a replacement login or PIN.
+        if !didCaptureTrackPreferenceAuth {
+            didCaptureTrackPreferenceAuth = true
+            trackPreferenceAuth = await TokenStore.shared.captureOrdinaryRequestAuth()
+        }
+        let membershipAuth = trackPreferenceAuth
+        let mayReadMembershipCache: Bool
+        if let membershipAuth {
+            mayReadMembershipCache = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: membershipAuth) != nil
+        } else { mayReadMembershipCache = false }
+        guard !Task.isCancelled, loadGeneration == detailLoadGeneration else { return }
         if detail?.contentId != contentId {
             #if !os(tvOS)
             seasonEpisodePrefetchTask?.cancel()
@@ -232,6 +251,14 @@ class ItemDetailViewModel {
         // first-ever visit) leaves the corresponding fields nil and the
         // view falls back to its skeleton.
         hydrateFromCache(contentId: contentId)
+        if mayReadMembershipCache, !Task.isCancelled,
+           let state: UserItemState = ResponseCache.shared.get(CacheKey.itemUserState(contentId)),
+           let owner = state.auth, let screenOwner = trackPreferenceAuth,
+           owner.account == screenOwner.account, owner.credentialOwner == screenOwner.credentialOwner,
+           owner.profileId == screenOwner.profileId, owner.profileToken == screenOwner.profileToken {
+            isFavorite = state.isFavorite
+            inWatchlist = state.inWatchlist
+        }
 
         #if os(tvOS)
         // Home / library focus may already have warmed this Series hierarchy.
@@ -284,10 +311,10 @@ class ItemDetailViewModel {
             // and related season/episode structure. They are intentionally
             // not on the critical path to the first painted hero.
             async let favoriteResult: Bool? = try? await SiloAPI.shared.isFavorite(
-                contentId: contentId
+                contentId: contentId, auth: membershipAuth
             )
             async let watchlistResult: Bool? = try? await SiloAPI.shared.isInWatchlist(
-                contentId: contentId
+                contentId: contentId, auth: membershipAuth
             )
             let userStateGeneration = userStateMutationGeneration
 
@@ -360,20 +387,24 @@ class ItemDetailViewModel {
             #endif
 
             let (favorite, watchlist) = await (favoriteResult, watchlistResult)
-            if let favorite, let watchlist,
-               !Task.isCancelled, loadGeneration == detailLoadGeneration,
+            let membershipIsCurrent: Bool
+            if let membershipAuth {
+                membershipIsCurrent = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: membershipAuth) != nil
+            } else { membershipIsCurrent = false }
+            if membershipIsCurrent, !Task.isCancelled, generation == detailGeneration,
+               let favorite, let watchlist,
+               loadGeneration == detailLoadGeneration,
                detail?.contentId == contentId,
                userStateMutationGeneration == userStateGeneration {
                 isFavorite = favorite
                 inWatchlist = watchlist
                 ResponseCache.shared.set(
-                    UserItemState(isFavorite: favorite, inWatchlist: watchlist),
+                    UserItemState(isFavorite: favorite, inWatchlist: watchlist, auth: membershipAuth),
                     for: CacheKey.itemUserState(contentId)
                 )
             } else {
                 // Leave whatever we hydrated from cache; per-item user
-                // state is non-fatal. Independent of the detail payload, so
-                // it still applies to a superseded load.
+                // state is non-fatal; a superseded read must not publish.
             }
         } catch let err {
             guard !Task.isCancelled, loadGeneration == detailLoadGeneration else { return }
@@ -576,35 +607,23 @@ class ItemDetailViewModel {
         #endif
     }
 
-    /// Adopt a detail payload the caller already has in hand, taking the
-    /// same path a `loadDetail` response would — enrichment, cache write,
-    /// watched flag, season/episode structure — minus the catalog fetch that
-    /// produced it and the favorite/watchlist round trips, which nothing
-    /// about a background refresh invalidates.
-    ///
-    /// Enrichment failing is not fatal here: it returns the payload
-    /// untouched, so the new trailers still render.
-    ///
-    /// Claiming a generation is what stops an entry `loadDetail` that is
-    /// still suspended in enrichment from landing its older, trailer-less
-    /// payload on top of this one afterwards.
-    private func apply(
-        item: ItemDetail,
-        contentId: String,
-        preserveSeasonSelection: Bool
-    ) async {
-        let generation = beginDetailWrite()
-        guard let enriched = await adoptDetail(
-            item,
-            contentId: contentId,
-            generation: generation
-        ) else { return }
-        isWatched = enriched.userData?.played ?? false
-        await loadRelatedStructure(
-            for: enriched,
-            contentId: contentId,
-            preserveSeasonSelection: preserveSeasonSelection
-        )
+    /// Publish the detail already observed under the trailer run's authority.
+    /// Keep cached playback metadata and the displayed season structure.
+    /// Claim a generation so older enrichment cannot replace the new trailers.
+    private func applyTrailerDetail(item: ItemDetail, contentId: String) {
+        // Publish the authorized observation without scheduling fresh reads.
+        // Existing season selection/structure remains on screen unchanged.
+        _ = beginDetailWrite()
+        let projected: ItemDetail
+        if supportsPlaybackMetadata(item),
+           let cached: WatchDetail = ResponseCache.shared.get(CacheKey.itemWatchDetail(contentId)) {
+            projected = applyingPlaybackMetadata(cached, to: item)
+        } else {
+            projected = item
+        }
+        detail = projected
+        ResponseCache.shared.set(projected, for: CacheKey.itemDetail(contentId))
+        isWatched = projected.userData?.played ?? false
     }
 
     /// Paint every cached fragment the screen knows how to render so a
@@ -626,10 +645,6 @@ class ItemDetailViewModel {
                       let seriesId = cached.seriesId {
                 seriesContentId = seriesId
             }
-        }
-        if let state: UserItemState = ResponseCache.shared.get(CacheKey.itemUserState(contentId)) {
-            isFavorite = state.isFavorite
-            inWatchlist = state.inWatchlist
         }
         if let seriesId = seriesContentId,
            seasons.isEmpty,
@@ -799,16 +814,22 @@ class ItemDetailViewModel {
         // capturing it here, so a view model that gets reused for another
         // item can never address the old one — and the pin makes them fail
         // outright rather than quietly switch items mid-run.
+        // The screen captures its owner before exposing selectable detail.
+        // Read that pinned snapshot, never current TokenStore authority.
         let coordinator = TrailerFetchCoordinator(
             request: { [weak self] in
                 let contentId = try self?.pinnedTrailerFetchContentId()
-                guard let contentId else { throw ItemDetailViewModelError.noItemLoaded }
-                return try await SiloAPI.shared.requestTrailersRefresh(contentId: contentId)
+                guard let contentId, let auth = self?.trackPreferenceAuth else { throw ItemDetailViewModelError.noItemLoaded }
+                return try await SiloAPI.shared.requestTrailersRefresh(contentId: contentId, auth: auth)
             },
             fetchDetail: { [weak self] in
                 let contentId = try self?.pinnedTrailerFetchContentId()
-                guard let contentId else { throw ItemDetailViewModelError.noItemLoaded }
-                return try await SiloAPI.shared.itemDetail(contentId: contentId)
+                guard let contentId, let auth = self?.trackPreferenceAuth else { throw ItemDetailViewModelError.noItemLoaded }
+                return try await SiloAPI.shared.trailerItemDetail(contentId: contentId, auth: auth)
+            },
+            matchesAuthority: { [weak self] in
+                guard let auth = self?.trackPreferenceAuth else { return false }
+                return await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
             }
         )
         trailerFetchStorage = coordinator
@@ -836,7 +857,7 @@ class ItemDetailViewModel {
     ///   cannot render remote (YouTube) cards — tvOS with no YouTube app
     ///   installed. iOS and macOS always can, so they leave it at true.
     func startTrailerFetch(remoteVideosDisplayable: Bool = true) {
-        guard let contentId = detail?.contentId, supportsTrailerFetch else { return }
+        guard let contentId = detail?.contentId, supportsTrailerFetch, trackPreferenceAuth != nil else { return }
         trailerFetchContentId = contentId
         trailerFetch.start(
             baseline: detail,
@@ -849,21 +870,11 @@ class ItemDetailViewModel {
             // even though the run has reported success. This lands while the
             // page is on screen, so the season the user is browsing must
             // survive it.
-            guard found.contentId == contentId else {
-                // Shouldn't happen (the run is pinned to one id), but a
-                // mismatched payload must never be written under this id.
-                await self.loadDetail(
-                    contentId: contentId,
-                    preserveSeasonSelection: true,
-                    coalescesMetadataRequests: false
-                )
-                return
-            }
-            await self.apply(
-                item: found,
-                contentId: contentId,
-                preserveSeasonSelection: true
-            )
+            guard found.contentId == contentId, self.detail?.contentId == contentId,
+                  let auth = self.trackPreferenceAuth else { return }
+            let mayApply = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard mayApply, !Task.isCancelled, self.detail?.contentId == contentId else { return }
+            self.applyTrailerDetail(item: found, contentId: contentId)
         }
     }
 
@@ -1379,9 +1390,15 @@ class ItemDetailViewModel {
     /// Loading a long season must not start one request per episode.
     func refreshSeriesEpisodeFavorite(contentId: String) async {
         let mutationVersion = episodeFavoriteMutationVersions[contentId, default: 0]
+        let generation = detailGeneration
+        guard let auth = trackPreferenceAuth,
+              await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil,
+              generation == detailGeneration, !Task.isCancelled else { return }
         do {
-            let favorite = try await SiloAPI.shared.isFavorite(contentId: contentId)
-            guard !Task.isCancelled,
+            let favorite = try await SiloAPI.shared.isFavorite(contentId: contentId, auth: auth)
+            guard await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil,
+                  !Task.isCancelled, generation == detailGeneration,
+                  seriesEpisodeWindow.episodes.contains(where: { $0.contentId == contentId }),
                   episodeFavoriteMutationVersions[contentId, default: 0] == mutationVersion else { return }
             episodeFavoriteStates[contentId] = favorite
         } catch {
@@ -1421,6 +1438,9 @@ class ItemDetailViewModel {
     ) async {
         episodeFavoriteRefreshGeneration += 1
         let generation = episodeFavoriteRefreshGeneration
+        guard let auth = trackPreferenceAuth,
+              await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil,
+              generation == episodeFavoriteRefreshGeneration, !Task.isCancelled else { return }
         let mutationVersionsAtStart = episodeFavoriteMutationVersions
         var states: [String: Bool] = [:]
 
@@ -1435,7 +1455,7 @@ class ItemDetailViewModel {
                 for episode in batch {
                     group.addTask {
                         let isFavorite = try? await SiloAPI.shared.isFavorite(
-                            contentId: episode.contentId
+                            contentId: episode.contentId, auth: auth
                         )
                         return (episode.contentId, isFavorite)
                     }
@@ -1454,6 +1474,8 @@ class ItemDetailViewModel {
             states.merge(batchStates) { _, refreshed in refreshed }
         }
 
+        let authorityIsCurrent = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+        guard authorityIsCurrent, !Task.isCancelled else { return }
         let currentIds = Set(self.episodes.map(\.contentId))
         guard generation == episodeFavoriteRefreshGeneration,
               currentIds == Set(episodes.map(\.contentId)) else { return }
@@ -1470,44 +1492,79 @@ class ItemDetailViewModel {
     // MARK: - User Actions
 
     func toggleFavorite() async {
-        guard let contentId = detail?.contentId else { return }
+        guard !favoriteMutationPending, let contentId = detail?.contentId,
+              !pendingEpisodeFavorites.contains(contentId),
+              let auth = trackPreferenceAuth else { return }
+        let generation = detailGeneration
+        let oldValue = isFavorite
+        let desiredValue = !oldValue
+        favoriteMutationPending = true
+        defer { favoriteMutationPending = false }
+        let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+        guard current, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
         userStateMutationGeneration += 1
-        isFavorite.toggle()
+        isFavorite = desiredValue
         writeBackUserState(contentId: contentId)
         do {
-            try await SiloAPI.shared.toggleFavorite(contentId: contentId, isFavorite: isFavorite)
+            try await SiloAPI.shared.toggleFavorite(contentId: contentId, isFavorite: desiredValue, auth: auth)
+            let mayPublish = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard mayPublish, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
             invalidateRelatedCaches(contentId: contentId)
         } catch {
-            isFavorite.toggle() // Revert on failure
+            let mayPublish = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard mayPublish, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
+            isFavorite = oldValue
             writeBackUserState(contentId: contentId)
         }
     }
 
     func toggleWatchlist() async {
-        guard let contentId = detail?.contentId else { return }
+        guard !watchlistMutationPending, let contentId = detail?.contentId,
+              let auth = trackPreferenceAuth else { return }
+        let generation = detailGeneration
+        let oldValue = inWatchlist
+        let desiredValue = !oldValue
+        watchlistMutationPending = true
+        defer { watchlistMutationPending = false }
+        let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+        guard current, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
         userStateMutationGeneration += 1
-        inWatchlist.toggle()
+        inWatchlist = desiredValue
         writeBackUserState(contentId: contentId)
         do {
-            try await SiloAPI.shared.toggleWatchlist(contentId: contentId, isInWatchlist: inWatchlist)
+            try await SiloAPI.shared.toggleWatchlist(contentId: contentId, isInWatchlist: desiredValue, auth: auth)
+            let mayPublish = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard mayPublish, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
             invalidateRelatedCaches(contentId: contentId)
         } catch {
-            inWatchlist.toggle() // Revert on failure
+            let mayPublish = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard mayPublish, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
+            inWatchlist = oldValue
             writeBackUserState(contentId: contentId)
         }
     }
 
-    /// Mark the detail item (and, for series/seasons, its leaf episodes)
-    /// as watched or unwatched. Backed by POST / DELETE
-    /// `/api/v1/watched/{contentId}` — the server resolves the targets.
+    /// Mark the displayed item; the server resolves any season/series fan-out.
     func toggleWatched() async {
-        guard let contentId = detail?.contentId else { return }
-        isWatched.toggle()
+        guard !watchedMutationPending, let contentId = detail?.contentId,
+              let auth = trackPreferenceAuth else { return }
+        let generation = detailGeneration
+        let oldValue = isWatched
+        let desiredValue = !oldValue
+        watchedMutationPending = true
+        defer { watchedMutationPending = false }
+        let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+        guard current, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
+        isWatched = desiredValue
         do {
-            try await SiloAPI.shared.setWatched(contentId: contentId, played: isWatched)
+            try await SiloAPI.shared.setWatched(contentId: contentId, played: desiredValue, auth: auth)
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard current, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
             invalidateRelatedCaches(contentId: contentId)
         } catch {
-            isWatched.toggle() // Revert on failure
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard current, generation == detailGeneration, detail?.contentId == contentId, !Task.isCancelled else { return }
+            isWatched = oldValue
         }
     }
 
@@ -1516,59 +1573,92 @@ class ItemDetailViewModel {
     /// mutation out to its episodes; refreshing the season + episode payloads
     /// keeps every checkmark and next-up calculation consistent afterward.
     func toggleSelectedSeasonWatched() async {
-        guard let selectedSeason,
-              let seriesId = seriesContentId else { return }
-
+        guard !watchedMutationPending, let selectedSeason,
+              let seriesId = seriesContentId, let auth = trackPreferenceAuth else { return }
+        let generation = detailGeneration
+        let displayedItem = detail?.contentId
+        let seasonId = selectedSeason.contentId
+        let seasonNumber = selectedSeason.seasonNumber
         let played = !(selectedSeason.userData?.played ?? false)
+        watchedMutationPending = true
+        defer { watchedMutationPending = false }
+        func isCurrent() async -> Bool {
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            return current && !Task.isCancelled && generation == detailGeneration
+                && displayedItem == detail?.contentId && seriesId == seriesContentId
+                && self.selectedSeason?.contentId == seasonId
+                && self.selectedSeason?.seasonNumber == seasonNumber
+        }
+        guard await isCurrent() else { return }
         do {
-            try await SiloAPI.shared.setWatched(
-                contentId: selectedSeason.contentId,
-                played: played
-            )
-            invalidateRelatedCaches(
-                contentId: selectedSeason.contentId,
-                seriesId: seriesId,
-                seasonNumber: selectedSeason.seasonNumber
-            )
-
-            await loadSeasons(
-                seriesId: seriesId,
-                autoSelectInitial: false,
-                coalescesMetadataRequest: false
-            )
-            if let refreshed = seasons.first(where: {
-                $0.contentId == selectedSeason.contentId
-                    || $0.seasonNumber == selectedSeason.seasonNumber
-            }) {
-                await selectSeason(
-                    refreshed,
-                    forceRefresh: true,
-                    coalescesMetadataRequest: false
-                )
-            }
+            try await SiloAPI.shared.setWatched(contentId: seasonId, played: played, auth: auth)
+            guard await isCurrent() else { return }
+            invalidateRelatedCaches(contentId: seasonId, seriesId: seriesId, seasonNumber: seasonNumber)
+            let response = try await SiloAPI.shared.seasons(seriesId: seriesId, auth: auth)
+            guard await isCurrent() else { return }
+            seasons = response.seasons.sortedForDisplay()
+            guard let refreshed = seasons.first(where: {
+                $0.contentId == seasonId && $0.seasonNumber == seasonNumber
+            }) else { return }
+            self.selectedSeason = refreshed
+            episodeLoadGeneration += 1
+            let refreshGeneration = episodeLoadGeneration
+            let episodeResponse = try? await SiloAPI.shared.episodes(seriesId: seriesId, seasonNumber: seasonNumber, auth: auth)
+            guard await isCurrent(), refreshGeneration == episodeLoadGeneration else { return }
+            isLoadingEpisodes = false
+            guard let episodeResponse else { return }
+            let sorted = episodeResponse.episodes.sorted { $0.episodeNumber < $1.episodeNumber }
+            episodesBySeason[seasonNumber] = sorted
+            episodes = sorted
+            loadedSeasonNumber = seasonNumber
+            #if os(tvOS)
+            scheduleEpisodeFavoriteStateRefresh(for: sorted, episodeLoadGeneration: refreshGeneration)
+            #else
+            await refreshEpisodeFavoriteStates(for: sorted)
+            #endif
         } catch {
-            // Leave the server-provided state untouched on failure.
+            // Keep the last displayed state; never replay an uncertain write.
         }
     }
 
     func setEpisodeWatched(contentId: String, played: Bool) async -> Bool {
+        guard !watchedMutationPending, let auth = trackPreferenceAuth else { return false }
+        let generation = detailGeneration
+        let displayedItem = detail?.contentId
+        let seriesId = seriesContentId
+        let seasonNumber = selectedSeason?.seasonNumber
+        let episodeIds = Set(episodes.map(\.contentId))
+        guard contentId == displayedItem || episodeIds.contains(contentId) else { return false }
+        watchedMutationPending = true
+        defer { watchedMutationPending = false }
+        func isCurrent() async -> Bool {
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            return current && !Task.isCancelled && generation == detailGeneration
+                && displayedItem == detail?.contentId && seriesId == seriesContentId
+                && seasonNumber == selectedSeason?.seasonNumber
+                && episodeIds == Set(episodes.map(\.contentId))
+        }
+        guard await isCurrent() else { return false }
         do {
-            try await SiloAPI.shared.setWatched(contentId: contentId, played: played)
-            if contentId == detail?.contentId {
-                isWatched = played
-            }
-            invalidateRelatedCaches(
-                contentId: contentId,
-                seriesId: seriesContentId,
-                seasonNumber: selectedSeason?.seasonNumber
-            )
-            if let seriesId = seriesContentId, let seasonNumber = selectedSeason?.seasonNumber {
-                await loadEpisodes(
-                    seriesId: seriesId,
-                    seasonNumber: seasonNumber,
-                    refreshFavoriteStates: false,
-                    coalescesMetadataRequest: false
-                )
+            try await SiloAPI.shared.setWatched(contentId: contentId, played: played, auth: auth)
+            guard await isCurrent() else { return false }
+            if contentId == displayedItem { isWatched = played }
+            invalidateRelatedCaches(contentId: contentId, seriesId: seriesId, seasonNumber: seasonNumber)
+            if let seriesId, let seasonNumber {
+                // The existing refresh follows the accepted write, but never
+                // joins an unscoped metadata flight or hydrates an old cache.
+                episodeLoadGeneration += 1
+                let refreshGeneration = episodeLoadGeneration
+                let response = try? await SiloAPI.shared.episodes(seriesId: seriesId, seasonNumber: seasonNumber, auth: auth)
+                guard await isCurrent(), refreshGeneration == episodeLoadGeneration else { return false }
+                isLoadingEpisodes = false
+                if let response {
+                    let sorted = response.episodes.sorted { $0.episodeNumber < $1.episodeNumber }
+                    episodesBySeason[seasonNumber] = sorted
+                    episodes = sorted
+                    loadedSeasonNumber = seasonNumber
+                    isLoadingEpisodes = false
+                }
             }
             return true
         } catch {
@@ -1577,8 +1667,27 @@ class ItemDetailViewModel {
     }
 
     func setEpisodeFavorite(contentId: String, isFavorite: Bool) async -> Bool {
+        guard !pendingEpisodeFavorites.contains(contentId),
+              let auth = trackPreferenceAuth else { return false }
+        let generation = detailGeneration
+        let displayedItem = detail?.contentId
+        let episodeIds = Set(episodes.map(\.contentId))
+        guard contentId == displayedItem || episodeIds.contains(contentId),
+              contentId != displayedItem || !favoriteMutationPending else { return false }
+        pendingEpisodeFavorites.insert(contentId)
+        defer { pendingEpisodeFavorites.remove(contentId) }
+        let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+        guard current, !Task.isCancelled, generation == detailGeneration,
+              displayedItem == detail?.contentId, episodeIds == Set(episodes.map(\.contentId)) else { return false }
+        // Invalidate an already-running membership read before dispatch as well
+        // as after success so it cannot publish across this explicit decision.
+        episodeFavoriteMutationVersions[contentId, default: 0] += 1
+        if contentId == displayedItem { userStateMutationGeneration += 1 }
         do {
-            try await SiloAPI.shared.toggleFavorite(contentId: contentId, isFavorite: isFavorite)
+            try await SiloAPI.shared.toggleFavorite(contentId: contentId, isFavorite: isFavorite, auth: auth)
+            let current = await TokenStore.shared.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+            guard current, !Task.isCancelled, generation == detailGeneration,
+                  displayedItem == detail?.contentId, episodeIds == Set(episodes.map(\.contentId)) else { return false }
             if contentId == detail?.contentId {
                 userStateMutationGeneration += 1
                 self.isFavorite = isFavorite
@@ -1657,4 +1766,11 @@ enum ItemDetailViewModelError: LocalizedError {
 struct UserItemState {
     let isFavorite: Bool
     let inWatchlist: Bool
+    let auth: CapturedOrdinaryRequestAuth?
+
+    init(isFavorite: Bool, inWatchlist: Bool, auth: CapturedOrdinaryRequestAuth? = nil) {
+        self.isFavorite = isFavorite
+        self.inWatchlist = inWatchlist
+        self.auth = auth
+    }
 }

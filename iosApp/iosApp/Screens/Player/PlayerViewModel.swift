@@ -510,7 +510,7 @@ class PlayerViewModel {
     /// elapsed-time field once every couple of seconds.
     private var lastNowPlayingPush: Date = .distantPast
 
-    private let sessionBridge = PlaybackSessionBridge()
+    private let sessionBridge: PlaybackSessionBridge
     @ObservationIgnored
     private var realtimeClient: PlaybackRealtimeClient!
     @ObservationIgnored
@@ -687,6 +687,7 @@ class PlayerViewModel {
     private struct OfflinePlaybackContext {
         let downloadId: String
         let mediaItemId: String
+        let progressAuthority: DownloadManager.OfflineProgressAuthority?
     }
     private var offlinePlaybackContext: OfflinePlaybackContext?
     /// Mirrors the server's default watched threshold (90%) so an offline
@@ -947,7 +948,8 @@ class PlayerViewModel {
     /// audio keep playing after this fires.
     private var foregroundExitObserverToken: NSObjectProtocol?
 
-    init() {
+    init(sessionBridge: PlaybackSessionBridge = PlaybackSessionBridge()) {
+        self.sessionBridge = sessionBridge
         do {
             aetherPlaybackController = try AetherPlaybackController()
         } catch {
@@ -1084,6 +1086,9 @@ class PlayerViewModel {
             }
         }
         settingsRefreshTask = Task { @MainActor [weak self] in
+            // The player keeps its initial owner for all subsequent selections.
+            // A profile/login change requires a new player, never a rebound write.
+            self?.trackPreferenceAuth = await TokenStore.shared.captureOrdinaryRequestAuth()
             await self?.refreshSettingsFromServer()
         }
     }
@@ -2278,6 +2283,7 @@ class PlayerViewModel {
         nextUpOnDeckItems = []
         isLoadingNextUpOnDeck = true
 
+        let auth = trackPreferenceAuth
         nextUpOnDeckTask = Task { @MainActor [weak self] in
             guard let self, !self.isDisposed else { return }
             defer {
@@ -2287,9 +2293,13 @@ class PlayerViewModel {
             }
 
             do {
-                let response = try await SiloAPI.shared.homeSections()
-                guard !Task.isCancelled, !self.isDisposed else { return }
-                self.nextUpOnDeckItems = await self.resolveOnDeckItems(from: response, currentDetail: detail)
+                let response = try await SiloAPI.shared.homeSections(auth: auth)
+                let current = await StartupContentPrefetcher.homeResponseIsCurrent(response)
+                guard current, !Task.isCancelled, !self.isDisposed else { return }
+                let items = await self.resolveOnDeckItems(from: response, currentDetail: detail)
+                let mayPublish = await StartupContentPrefetcher.homeResponseIsCurrent(response)
+                guard mayPublish, !Task.isCancelled, !self.isDisposed else { return }
+                self.nextUpOnDeckItems = items
                 self.isLoadingNextUpOnDeck = false
                 self.updateNextUpPresentation(for: self.currentTime)
             } catch {
@@ -2408,51 +2418,8 @@ class PlayerViewModel {
         seasonNumber: Int,
         episodeNumber: Int
     ) async throws -> PlayerNextUpEpisode? {
-        async let seasonsTask = SiloAPI.shared.seasons(seriesId: seriesId)
-        async let currentEpisodesTask = SiloAPI.shared.episodes(
-            seriesId: seriesId,
-            seasonNumber: seasonNumber
-        )
-
-        let seasonsResponse = try await seasonsTask
-        let currentEpisodesResponse = try await currentEpisodesTask
-        let seasons = seasonsResponse.seasons.sortedForDisplay()
-        var episodes = currentEpisodesResponse.episodes
-
-        let nextSeason = seasons.first { season in
-            !(season.isSpecials ?? false) && season.seasonNumber > seasonNumber
-        }
-        if let nextSeason {
-            let nextSeasonEpisodes = try await SiloAPI.shared.episodes(
-                seriesId: seriesId,
-                seasonNumber: nextSeason.seasonNumber
-            )
-            episodes.append(contentsOf: nextSeasonEpisodes.episodes)
-        }
-
-        let orderedEpisodes = episodes.sorted { lhs, rhs in
-            if lhs.seasonNumber != rhs.seasonNumber {
-                return lhs.seasonNumber < rhs.seasonNumber
-            }
-            if lhs.episodeNumber != rhs.episodeNumber {
-                return lhs.episodeNumber < rhs.episodeNumber
-            }
-            return lhs.contentId < rhs.contentId
-        }
-
-        let currentIndex = orderedEpisodes.firstIndex { $0.contentId == contentId }
-            ?? orderedEpisodes.firstIndex {
-                $0.seasonNumber == seasonNumber && $0.episodeNumber == episodeNumber
-            }
-        guard let currentIndex, currentIndex < orderedEpisodes.index(before: orderedEpisodes.endIndex) else {
-            return nil
-        }
-
-        return PlayerNextUpEpisode(
-            episode: orderedEpisodes[orderedEpisodes.index(after: currentIndex)],
-            seriesId: seriesId,
-            seriesTitle: seriesTitle
-        )
+        try await PlayerNextUpEpisode.resolve(contentId: contentId, seriesId: seriesId, seriesTitle: seriesTitle,
+                                              seasonNumber: seasonNumber, episodeNumber: episodeNumber)
     }
 
     private func updateNextUpPresentation(for movieTime: Double) {
@@ -2771,7 +2738,7 @@ class PlayerViewModel {
         let deinterlaceFieldRate: DeinterlaceFieldRate = settings.deinterlaceFieldRate == .film
             ? .frame
             : .field
-        let spec: AetherLoadSpec
+        var spec: AetherLoadSpec
         if let v3 = prepared.protocolV3 {
             let audioSourceStreamIndex: Int32?
             let selectedAudioOrdinal = v3.plan.selectedTracks.audio?.index
@@ -2806,22 +2773,37 @@ class PlayerViewModel {
             } else {
                 audioSourceStreamIndex = nil
             }
+            let proxyScope = streamRequest.proxyAuxiliaryScope
+            if let proxyScope {
+                guard proxyScope.planID == v3.plan.planId, proxyScope.sessionID == prepared.session.sessionId else {
+                    throw PlaybackSequencedError.authorityChanged
+                }
+                let selectedURLs = [v3.plan.subtitle.artifact?.url, v3.plan.selectedSubtitleInventoryItem?.fontBundleUrl]
+                for raw in selectedURLs.compactMap({ $0 }) where StreamRequest.isHeaderAuthenticatedAuxiliaryURL(raw) {
+                    _ = try await proxyScope.materialize(raw)
+                    try requireCurrentStreamLoad(expectedStreamLoadGeneration)
+                }
+                try await proxyScope.requireCurrent()
+            }
             spec = try AetherLoadSpec(
                 validating: v3.plan,
                 sessionID: prepared.session.sessionId,
                 matchContentEnabled: settings.hdrEnabled && AetherDisplayContext.matchContentEnabled,
                 sourceURLOverride: streamRequest.url,
                 requestHeaders: streamRequest.headers,
-                // Subtitle artifacts, inventory sidecars and font bundles stay
-                // relative API-origin routes even when the media itself moved
-                // to a proxy, so this resolver never accepts absolute URLs.
+                // Proxy artifacts resolve only to their already downloaded
+                // exact bytes. Existing API-relative references stay opaque.
                 resolveURL: { raw in
-                    StreamRequest.resolve(
+                    if StreamRequest.isHeaderAuthenticatedAuxiliaryURL(raw) {
+                        return proxyScope?.localURL(for: raw)
+                    }
+                    return StreamRequest.resolve(
                         rawURL: raw,
                         serverURL: streamRequest.serverUrl,
                         additionalHeaders: [:],
                         accessToken: nil,
-                        requiresHeaderAuthenticatedMedia: true
+                        requiresHeaderAuthenticatedMedia: true,
+                        apiV2SessionId: prepared.session.sessionId
                     )?.url
                 },
                 apiOriginURL: URL(string: streamRequest.serverUrl),
@@ -2833,6 +2815,7 @@ class PlayerViewModel {
                 deinterlaceFieldRate: deinterlaceFieldRate,
                 resumeSourcePosition: resumeSourcePosition
             )
+            spec.proxyAuxiliaryScope = proxyScope
         } else if streamRequest.url.isFileURL {
             let audioStreamIndex: Int32?
             if let ordinal = prepared.session.audioTrackIndex {
@@ -3867,6 +3850,8 @@ class PlayerViewModel {
         pendingServerRenderedSubtitleTrackId = intent.serverRenderedSubtitleTrackId
     }
 
+    private var trackPreferenceAuth: CapturedOrdinaryRequestAuth?
+
     private func beginFreshLoad(
         request: LoadRequest,
         progressPosition: Double?,
@@ -3953,10 +3938,11 @@ class PlayerViewModel {
                 }
             }
 
+            var stopResolution = PlaybackSessionStopResolution.noSession
             await pendingNaturalEndProgressTask?.value
             if let snapshotPosition, snapshotPosition.isFinite, snapshotPosition >= 0 {
                 if shouldFinalizeCurrentSession {
-                    await self.sessionBridge.stopSession(position: snapshotPosition, isPaused: true)
+                    stopResolution = await self.sessionBridge.stopSession(position: snapshotPosition, isPaused: true)
                 } else {
                     await self.sessionBridge.reportProgress(position: snapshotPosition, isPaused: true)
                 }
@@ -3978,6 +3964,11 @@ class PlayerViewModel {
             do {
                 self.disposeAetherPlayback(forReplacement: true)
                 guard !Task.isCancelled, !self.isDisposed else { return }
+                // Abandonment releases recovery, but cannot authorize this
+                // captured successor. A later explicit Play creates new intent.
+                if stopResolution == .ownerLost {
+                    throw PlaybackOwnerLossRecovery.terminalFailure
+                }
 
                 // The init kicked off `settingsRefreshTask` to fetch the
                 // server's effective device settings before playback
@@ -4008,7 +3999,8 @@ class PlayerViewModel {
                     )
                     preparedOfflineContext = OfflinePlaybackContext(
                         downloadId: offline.downloadId,
-                        mediaItemId: offline.mediaItemId
+                        mediaItemId: offline.mediaItemId,
+                        progressAuthority: await DownloadManager.shared.captureOfflineProgressAuthority()
                     )
                     preparedOfflineArtworkURL = offline.posterFileURL
                     prepared = offline.prepared
@@ -5495,7 +5487,8 @@ class PlayerViewModel {
         } else {
             request = TrackSelectionPersistence.audioRequest(track: track, ordinal: ordinal)
         }
-        TrackSelectionPersistence.saveAudio(prefKey: key, request: request)
+        guard let auth = trackPreferenceAuth else { return }
+        TrackSelectionPersistence.saveAudio(prefKey: key, request: request, auth: auth)
     }
 
     /// Best-effort write of an explicit subtitle pick (or explicit
@@ -5522,7 +5515,8 @@ class PlayerViewModel {
         } else {
             request = TrackSelectionPersistence.subtitleOffRequest(showForced: showForced)
         }
-        TrackSelectionPersistence.saveSubtitle(prefKey: key, request: request)
+        guard let auth = trackPreferenceAuth else { return }
+        TrackSelectionPersistence.saveSubtitle(prefKey: key, request: request, auth: auth)
     }
 
     func selectSecondarySubtitle(_ track: PlayerTrack) {
@@ -5635,11 +5629,20 @@ class PlayerViewModel {
     /// is a harmless no-op — no ownership latch is needed here.
     @MainActor
     func downloadSearchedSubtitle(_ result: SubtitleSearchResult) async -> Bool {
-        guard let fileId = currentSelectedVersion?.fileId else { return false }
+        guard let fileId = currentSelectedVersion?.fileId,
+              let sessionID = activePlaybackSessionId,
+              let auth = await TokenStore.shared.captureOrdinaryRequestAuth() else { return false }
+        func stillCurrent() async -> Bool {
+            guard let current = await TokenStore.shared.captureOrdinaryRequestAuth() else { return false }
+            return current.account == auth.account && current.profileId == auth.profileId
+                && current.profileToken == auth.profileToken && activePlaybackSessionId == sessionID
+                && currentSelectedVersion?.fileId == fileId
+        }
         do {
             let subtitle = try await SiloAI.shared.downloadSubtitle(
-                SubtitleDownloadBody(from: result, mediaFileId: fileId)
+                SubtitleDownloadBody(from: result, mediaFileId: fileId), expectedAuth: auth
             )
+            guard await stillCurrent() else { return false }
             let downloaded = try await SiloAI.shared.downloadedSubtitles(mediaFileId: fileId)
             // Revalidate after the awaits: if playback moved to a different
             // file while the download was in flight, `makeSubtitleHandoffContext`
@@ -5647,7 +5650,7 @@ class PlayerViewModel {
             // file's listing position against it would select a wrong or
             // invalid track. The download itself is persisted server-side
             // either way; the next session of that file picks it up.
-            guard currentSelectedVersion?.fileId == fileId else {
+            guard await stillCurrent() else {
                 Self.logger.info(
                     "[SUB-SEARCH] media file changed during download of subtitle id=\(subtitle.id, privacy: .public); skipping live handoff"
                 )
@@ -5662,6 +5665,7 @@ class PlayerViewModel {
             guard let context = makeSubtitleHandoffContext(),
                   let descriptor = downloaded[position].synthesizedDescriptor(
                       sessionId: context.sessionId,
+                      executorReference: context.executorReference,
                       baseTrackCount: context.baseTrackCount,
                       position: position,
                       resolveURL: context.resolveURL
@@ -5703,15 +5707,20 @@ class PlayerViewModel {
             return nil
         }
         let serverUrl = resolvedServerUrl
-        guard let inventory = activePreparedProtocolV3?.plan.subtitle.inventory else {
+        guard let plan = activePreparedProtocolV3?.plan,
+              let reference = StreamRequest.v2ExecutorReference(rawURL: plan.stream.url, sessionID: sessionId) else {
             Self.logger.warning("[AI-SUB] no V3 subtitle inventory for subtitle handoff")
             return nil
         }
-        let baseTrackCount = Self.protocolV3DownloadedSubtitleBaseTrackCount(inventory)
+        let baseTrackCount = Self.protocolV3DownloadedSubtitleBaseTrackCount(plan.subtitle.inventory)
         return SubtitleAIController.HandoffContext(
             sessionId: sessionId,
+            executorReference: reference,
             baseTrackCount: baseTrackCount,
-            resolveURL: { [weak self] path in self?.resolveServerUrl(path, serverUrl: serverUrl) }
+            resolveURL: { path in
+                StreamRequest.resolve(rawURL: path, serverURL: serverUrl, additionalHeaders: [:], accessToken: nil,
+                    requiresHeaderAuthenticatedMedia: true, apiV2SessionId: sessionId)?.url
+            }
         )
     }
 
@@ -5832,7 +5841,7 @@ class PlayerViewModel {
         Self.logger.info(
             "[AI-SUB] registering completed subtitle index=\(descriptor.index, privacy: .public) lang=\(descriptor.language ?? "nil", privacy: .public) trackId=\(trackId, privacy: .public) autoSelect=\(autoSelect, privacy: .public)"
         )
-        aetherPlaybackController.addExternalSubtitleTrack(
+        addScopedExternalSubtitleTrack(
             ExternalSubtitleTrack(
                 url: descriptor.url,
                 name: descriptor.label,
@@ -6570,20 +6579,16 @@ class PlayerViewModel {
         requiresHeaderAuthenticatedMedia: Bool = false,
         allowsAuthorizedMediaOrigins: Bool = false
     ) async -> StreamRequest? {
-        let serverUrl = await SiloAPI.shared.currentServerUrl()
-        let token = await SiloAPI.shared.currentAccessToken()
-        return StreamRequest.resolve(
-            rawURL: session.streamUrl,
-            serverURL: serverUrl,
+        if session.streamUrl.hasPrefix("file://") {
+            return StreamRequest.resolve(rawURL: session.streamUrl, serverURL: "",
+                additionalHeaders: [:], accessToken: nil,
+                requiresHeaderAuthenticatedMedia: requiresHeaderAuthenticatedMedia)
+        }
+        return try? await PlaybackMutationCoordinator.shared.streamRequest(
+            sessionID: session.sessionId, rawURL: session.streamUrl,
             additionalHeaders: additionalHeaders,
-            accessToken: token,
             requiresHeaderAuthenticatedMedia: requiresHeaderAuthenticatedMedia,
-            // The caller knows the attempt's session, so a proxy URL naming a
-            // different one is rejected rather than trusted.
-            authorizedMediaOriginSessionId: allowsAuthorizedMediaOrigins
-                ? session.sessionId
-                : nil
-        )
+            allowsAuthorizedMediaOrigins: allowsAuthorizedMediaOrigins)
     }
 
     /// Turns a server-supplied URL (absolute or API-relative) into an absolute URL.
@@ -6638,7 +6643,7 @@ class PlayerViewModel {
                   let url = resolveServerUrl(known.url, serverUrl: resolvedServerUrl) else {
                 continue
             }
-            aetherPlaybackController.addExternalSubtitleTrack(
+            addScopedExternalSubtitleTrack(
                 ExternalSubtitleTrack(
                     url: url,
                     name: known.label,
@@ -6727,7 +6732,7 @@ class PlayerViewModel {
         )
         for descriptor in descriptors {
             let appTrackID = SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: descriptor.index)
-            aetherPlaybackController.addExternalSubtitleTrack(
+            addScopedExternalSubtitleTrack(
                 ExternalSubtitleTrack(
                     url: descriptor.url,
                     name: descriptor.label,
@@ -6748,6 +6753,39 @@ class PlayerViewModel {
             )
         }
         adoptAetherInventory()
+    }
+
+    /// New proxy sidecars must be delivered before registration. Aether's
+    /// existing decoder sees local bytes and cannot redirect the captured bearer.
+    private func addScopedExternalSubtitleTrack(_ track: ExternalSubtitleTrack, appTrackID: Int64,
+                                               fontRequest: URLRequest? = nil,
+                                               completion: (() -> Void)? = nil) {
+        let scope = aetherPlaybackController.activeSpec?.proxyAuxiliaryScope
+        let proxyTrack = StreamRequest.isHeaderAuthenticatedAuxiliaryURL(track.url.absoluteString)
+        let proxyFont = fontRequest?.url.map { url in
+            StreamRequest.isHeaderAuthenticatedAuxiliaryURL(url.absoluteString)
+        } ?? false
+        guard proxyTrack || proxyFont else {
+            aetherPlaybackController.addExternalSubtitleTrack(track, appTrackID: appTrackID, fontRequest: fontRequest)
+            completion?()
+            return
+        }
+        guard let scope, let epoch = activeAetherLoadEpoch else { return }
+        Task { @MainActor [weak self] in
+            do {
+                let delivered = try await scope.materializeTrack(track, fontRequest: fontRequest)
+                try await scope.requireCurrent()
+                guard let self, self.activeAetherLoadEpoch == epoch,
+                      self.aetherPlaybackController.activeSpec?.proxyAuxiliaryScope === scope else { return }
+                self.aetherPlaybackController.addExternalSubtitleTrack(delivered.track, appTrackID: appTrackID, fontRequest: delivered.fontRequest)
+                self.adoptAetherInventory()
+                completion?()
+            } catch {
+                // No direct-URL fallback: it would restore Aether's redirecting
+                // network path after the owned transfer was refused.
+                Self.logger.warning("Proxy subtitle delivery was refused")
+            }
+        }
     }
 
     /// Aether interprets nil subtitle headers as "inherit every media header."
@@ -6892,6 +6930,14 @@ class PlayerViewModel {
             aetherPlaybackController.selectSecondarySubtitleTrack(id: nil)
             return
         }
+        if !aetherPlaybackController.containsSubtitle(appTrackID: trackId),
+           let url = protocolV3InventorySidecarURL(for: track), StreamRequest.isHeaderAuthenticatedAuxiliaryURL(url.absoluteString) {
+            registerSecondarySubtitleWithAetherIfNeeded(track) { [weak self] in
+                guard let self, self.selectedSecondarySubtitleId == trackId else { return }
+                self.aetherPlaybackController.selectSecondarySubtitleTrack(id: trackId)
+            }
+            return
+        }
         registerSecondarySubtitleWithAetherIfNeeded(track)
         // Only a track Aether actually holds can be rendered as the secondary
         // one. Under V3 the plan mounts a single artifact, so an inventory row
@@ -6915,12 +6961,12 @@ class PlayerViewModel {
     /// The plan declares exactly one artifact, which is the primary. Every
     /// other picker row is server metadata the engine has never seen, so a
     /// dual-subtitle pick has to register its URL before it can be selected.
-    private func registerSecondarySubtitleWithAetherIfNeeded(_ track: PlayerTrack) {
+    private func registerSecondarySubtitleWithAetherIfNeeded(_ track: PlayerTrack, completion: (() -> Void)? = nil) {
         guard !aetherPlaybackController.containsSubtitle(appTrackID: track.trackId),
               let url = protocolV3InventorySidecarURL(for: track) else {
             return
         }
-        aetherPlaybackController.addExternalSubtitleTrack(
+        addScopedExternalSubtitleTrack(
             ExternalSubtitleTrack(
                 url: url,
                 name: track.title,
@@ -6932,7 +6978,14 @@ class PlayerViewModel {
                 formatHint: track.codec,
                 nativeTimelineOffsetSeconds: aetherPlaybackController.activeSpec?.timeline.timelineOffsetSeconds ?? 0
             ),
-            appTrackID: track.trackId
+            appTrackID: track.trackId,
+            fontRequest: activePreparedProtocolV3?.plan.subtitle.inventory.first(where: { $0.combinedIndex == track.srcId })?
+                .fontBundleUrl.flatMap { resolveServerUrl($0, serverUrl: resolvedServerUrl) }.map { url in
+                    var request = URLRequest(url: url)
+                    request.allHTTPHeaderFields = aetherSubtitleRequestHeaders(for: url)
+                    return request
+                },
+            completion: completion
         )
     }
 
@@ -7427,7 +7480,8 @@ class PlayerViewModel {
             mediaItemId: context.mediaItemId,
             position: position,
             duration: duration,
-            completed: watched
+            completed: watched,
+            authority: context.progressAuthority
         )
     }
 

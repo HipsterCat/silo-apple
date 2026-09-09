@@ -77,6 +77,12 @@ struct SearchView: View {
             if presentedID != nil { isSearchFieldFocused = false }
         }
         #endif
+        .task {
+            if !viewModel.hasSearched && !viewModel.query.trimmingCharacters(in: .whitespaces).isEmpty {
+                await viewModel.performSearch()
+            }
+        }
+        .onDisappear { viewModel.cancel() }
         .onChange(of: viewModel.query) { _, _ in
             viewModel.onQueryChanged()
             requestsViewModel.onQueryChanged(viewModel.query)
@@ -161,9 +167,14 @@ struct SearchView: View {
             }
         } else {
             VStack(alignment: .leading, spacing: SiloTheme.padding) {
-                Text("\(viewModel.total) result\(viewModel.total == 1 ? "" : "s")")
+                Text(viewModel.countLabel)
                     .font(.siloCaption)
                     .foregroundColor(.siloSecondaryText)
+
+                if let window = viewModel.resultWindowLimit, viewModel.total > window {
+                    Text("Showing up to \(window) ranked matches. Refine your search to see other results.")
+                        .font(.siloCaption).foregroundColor(.siloSecondaryText)
+                }
 
 #if os(tvOS)
                 TVCatalogGrid(
@@ -178,6 +189,7 @@ struct SearchView: View {
                     cardWidth: 220,
                     prefersDefaultFocusOnFirstItem: true
                 )
+                .environment(\.catalogSearchModel, viewModel)
 #else
                 CatalogGrid(
                     items: viewModel.results,
@@ -188,6 +200,7 @@ struct SearchView: View {
                         Task { await viewModel.loadMore() }
                     }
                 )
+                .environment(\.catalogSearchModel, viewModel)
 #endif
             }
         }

@@ -13,6 +13,7 @@ actor PlaybackRealtimeClient {
     private let commandHandler: CommandHandler
     private let eventHandler: EventHandler?
     private let session: URLSession
+    private let mutationCoordinator: PlaybackMutationCoordinator
     private let encoder = JSONEncoder()
     private let reconnectDelaysNanos: [UInt64] = [
         500_000_000,
@@ -53,10 +54,12 @@ actor PlaybackRealtimeClient {
 
     init(
         session: URLSession = .shared,
+        mutationCoordinator: PlaybackMutationCoordinator = .shared,
         commandHandler: @escaping CommandHandler,
         eventHandler: EventHandler? = nil
     ) {
         self.session = session
+        self.mutationCoordinator = mutationCoordinator
         self.commandHandler = commandHandler
         self.eventHandler = eventHandler
     }
@@ -95,13 +98,21 @@ actor PlaybackRealtimeClient {
     }
 
     private func runConnectionLoop(sessionId: String, generation: Int) async {
+        let binding: PlaybackMutationCoordinator.ControlBinding
+        do { binding = try await mutationCoordinator.controlBinding(sessionID: sessionId) }
+        catch {
+            guard isCurrentBinding(sessionId: sessionId, generation: generation) else { return }
+            setRealtimeUnavailable(true)
+            return
+        }
         var attempt = 0
         var consecutiveFailures = 0
 
         while isCurrentBinding(sessionId: sessionId, generation: generation) {
             do {
-                let request = try await makeRequest(sessionId: sessionId)
+                let request = try await mutationCoordinator.controlRequest(binding)
                 try Task.checkCancellation()
+                guard isCurrentBinding(sessionId: sessionId, generation: generation) else { return }
 
                 let socket = session.webSocketTask(with: request)
                 self.socket = socket
@@ -113,7 +124,7 @@ actor PlaybackRealtimeClient {
                 consecutiveFailures = 0
                 setRealtimeConnected(true)
                 setRealtimeUnavailable(false)
-                try await receiveLoop(on: socket, sessionId: sessionId, generation: generation)
+                try await receiveLoop(on: socket, sessionId: sessionId, generation: generation, binding: binding)
             } catch is CancellationError {
                 break
             } catch {
@@ -215,10 +226,13 @@ actor PlaybackRealtimeClient {
     private func receiveLoop(
         on socket: URLSessionWebSocketTask,
         sessionId: String,
-        generation: Int
+        generation: Int,
+        binding: PlaybackMutationCoordinator.ControlBinding
     ) async throws {
         while isCurrentBinding(sessionId: sessionId, generation: generation) {
             let message = try await socket.receive()
+            try await mutationCoordinator.validateControlBinding(binding)
+            guard isCurrentBinding(sessionId: sessionId, generation: generation) else { return }
             guard let data = decodeInboundMessageData(message) else { continue }
             guard let inbound = parsePlaybackRealtimeInboundMessage(data) else { continue }
 
@@ -241,77 +255,46 @@ actor PlaybackRealtimeClient {
                     on: socket
                 )
 
-                do {
-                    try await commandHandler(command)
-                    try await send(
-                        makePlaybackRealtimeResult(
-                            sessionId: sessionId,
-                            commandId: command.commandId,
-                            status: .completed
-                        ),
-                        on: socket
-                    )
-                } catch let error as PlaybackRealtimeCommandExecutionError {
-                    try await send(
-                        makePlaybackRealtimeResult(
-                            sessionId: sessionId,
-                            commandId: command.commandId,
-                            status: .rejected,
-                            error: error.rejectionReason
-                        ),
-                        on: socket
-                    )
-                } catch {
-                    try await send(
-                        makePlaybackRealtimeResult(
-                            sessionId: sessionId,
-                            commandId: command.commandId,
-                            status: .rejected,
-                            error: PlaybackRealtimeCommandExecutionError.commandFailed.rejectionReason
-                        ),
-                        on: socket
-                    )
-                }
+                try await Self.executeCommand(command, handler: commandHandler, validate: {
+                    try await self.mutationCoordinator.validateControlBinding(binding)
+                    guard await self.isCurrentBinding(sessionId: sessionId, generation: generation) else {
+                        throw CancellationError()
+                    }
+                }, sendResult: { result in try await self.send(result, on: socket) })
             }
         }
     }
 
-    private func makeRequest(sessionId: String) async throws -> URLRequest {
-        let serverUrl = await SiloAPI.shared.currentServerUrl()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !serverUrl.isEmpty else {
-            throw PlaybackRealtimeTransportError.serverUrlNotConfigured
+    /// Keep the command result boundary testable without opening a socket.
+    @MainActor
+    static func executeCommand(_ command: PlaybackRealtimeCommandEnvelope,
+                               handler: CommandHandler,
+                               validate: () async throws -> Void,
+                               sendResult: (PlaybackRealtimeResultEnvelope) async throws -> Void) async throws {
+        try Task.checkCancellation()
+        try await validate()
+        let result: PlaybackRealtimeResultEnvelope
+        do {
+            try await handler(command)
+            result = makePlaybackRealtimeResult(sessionId: command.sessionId,
+                commandId: command.commandId, status: .completed)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as PlaybackSequencedError {
+            throw error
+        } catch let error as PlaybackRealtimeCommandExecutionError {
+            result = makePlaybackRealtimeResult(sessionId: command.sessionId,
+                commandId: command.commandId, status: .rejected, error: error.rejectionReason)
+        } catch {
+            result = makePlaybackRealtimeResult(sessionId: command.sessionId,
+                commandId: command.commandId, status: .rejected,
+                error: PlaybackRealtimeCommandExecutionError.commandFailed.rejectionReason)
         }
-
-        guard var components = URLComponents(string: serverUrl) else {
-            throw PlaybackRealtimeTransportError.invalidServerURL(serverUrl)
-        }
-
-        let normalizedPath = "/api/v1/playback/sessions/\(sessionId)/control/ws"
-        let basePath = components.percentEncodedPath
-        let trimmedBase = basePath.hasSuffix("/") ? String(basePath.dropLast()) : basePath
-        components.percentEncodedPath = trimmedBase + normalizedPath
-
-        switch components.scheme?.lowercased() {
-        case "https":
-            components.scheme = "wss"
-        case "http":
-            components.scheme = "ws"
-        default:
-            break
-        }
-
-        guard let url = components.url else {
-            throw PlaybackRealtimeTransportError.invalidServerURL(serverUrl)
-        }
-
-        var request = URLRequest(url: url)
-        if let token = await SiloAPI.shared.currentAccessToken(), !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        } else {
-            throw PlaybackRealtimeTransportError.missingAccessToken
-        }
-        return request
+        // Completion and rejection have the same authority boundary. A failed
+        // fence or send must never become another write on the stale socket.
+        try Task.checkCancellation()
+        try await validate()
+        try await sendResult(result)
     }
 
     private func send<T: Encodable>(

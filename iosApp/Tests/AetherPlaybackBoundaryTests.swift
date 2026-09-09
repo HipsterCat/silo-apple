@@ -5,6 +5,37 @@ import XCTest
 
 @MainActor
 final class AetherPlaybackBoundaryTests: XCTestCase {
+    func testV2DeliveryURLPreservesOpaqueQueryAndSession() {
+        let session = "11111111-1111-4111-8111-111111111111"
+        for path in ["/api/v2/stream/\(session)", "/api/v2/playback/transcode/\(session)/master.m3u8"] {
+            let raw = path + "?st=opaque%2Bsignature%2Fvalue%3D"
+            let request = StreamRequest.resolve(rawURL: raw, serverURL: "https://silo.example/base",
+                additionalHeaders: ["X-Profile-Id": "profile", "X-Profile-Token": "pin"], accessToken: "account",
+                requiresHeaderAuthenticatedMedia: true, apiV2SessionId: session)
+            XCTAssertEqual(request?.url.absoluteString, "https://silo.example/base" + raw)
+            XCTAssertEqual(request?.headers["Authorization"], "Bearer account")
+            XCTAssertEqual(request?.headers["X-Profile-Id"], "profile")
+            XCTAssertEqual(request?.headers["X-Profile-Token"], "pin")
+            XCTAssertNil(StreamRequest.resolve(rawURL: raw, serverURL: "https://silo.example",
+                additionalHeaders: [:], accessToken: "account", requiresHeaderAuthenticatedMedia: true))
+            XCTAssertNil(StreamRequest.resolve(rawURL: raw, serverURL: "https://silo.example",
+                additionalHeaders: [:], accessToken: "account", requiresHeaderAuthenticatedMedia: true,
+                apiV2SessionId: "22222222-2222-4222-8222-222222222222"))
+        }
+    }
+
+    func testV2DeliveryURLRejectsOtherPathsAndCredentials() {
+        let session = "11111111-1111-4111-8111-111111111111"
+        let path = "/api/v2/stream/\(session)"
+        for raw in [path, path + "?st=", path + "?st=a&st=b", path + "?st=a&token=account",
+                    path + "?st=a#fragment", path + "/../other?st=a", path + "/extra?st=a",
+                    "https://other.example" + path + "?st=a", "//other.example" + path + "?st=a"] {
+            XCTAssertNil(StreamRequest.resolve(rawURL: raw, serverURL: "https://silo.example",
+                additionalHeaders: [:], accessToken: "account", requiresHeaderAuthenticatedMedia: true,
+                apiV2SessionId: session), raw)
+        }
+    }
+
     private struct LiveStreamFixture: Decodable {
         let label: String?
         let url: URL
@@ -234,6 +265,58 @@ final class AetherPlaybackBoundaryTests: XCTestCase {
                 requiresHeaderAuthenticatedMedia: true
             ), "unexpectedly accepted \(raw)")
         }
+    }
+
+    func testV2SubtitleStableIdentityPinsKeepExactIssuedBytes() throws {
+        let id = "11111111-1111-4111-8111-111111111111"
+        let externalKey = String(repeating: "ab", count: 32)
+        for tail in ["2.ass?file_id=42&embedded_stream_index=7&st=opaque%2Bproof",
+                     "2/fonts?embedded_stream_index=0&file_id=42&st=opaque",
+                     "0.vtt?external_subtitle_key=\(externalKey)&st=opaque&file_id=42",
+                     "0/fonts?st=opaque&file_id=42&external_subtitle_key=%61\(externalKey.dropFirst())"] {
+            let raw = "/api/v2/stream/\(id)/subtitles/" + tail
+            let result = try XCTUnwrap(StreamRequest.resolve(rawURL: raw, serverURL: "https://server.example",
+                additionalHeaders: [:], accessToken: "owner", requiresHeaderAuthenticatedMedia: true, apiV2SessionId: id))
+            XCTAssertEqual(result.url.absoluteString, "https://server.example" + raw)
+        }
+    }
+
+    func testV2SubtitlePinsRejectConflictsAndCannotQualifyMediaPaths() {
+        let id = "11111111-1111-4111-8111-111111111111"
+        let key = String(repeating: "ab", count: 32)
+        for query in ["embedded_stream_index=", "embedded_stream_index=-1", "embedded_stream_index=1.5",
+                      "embedded_stream_index=1&embedded_stream_index=2",
+                      "external_subtitle_key=invalid", "external_subtitle_key=\(key)&external_subtitle_key=\(key)",
+                      "embedded_stream_index=1&external_subtitle_key=\(key)",
+                      "embedded_stream_index=1&downloaded_subtitle_id=2",
+                      "external_subtitle_key=\(key)&downloaded_subtitle_id=2"] {
+            XCTAssertNil(StreamRequest.v2ExecutorReference(
+                rawURL: "/api/v2/stream/\(id)/subtitles/0.vtt?st=proof&" + query, sessionID: id))
+        }
+        for query in ["embedded_stream_index=1", "external_subtitle_key=\(key)"] {
+            XCTAssertNil(StreamRequest.v2ExecutorReference(
+                rawURL: "/api/v2/stream/\(id)?st=proof&" + query, sessionID: id))
+        }
+    }
+
+    func testV2SubtitleAndFontsRequireExactSessionAndExecutorReference() throws {
+        let id = "11111111-1111-4111-8111-111111111111"
+        for tail in ["2.vtt?st=opaque%2Bproof&file_id=42&downloaded_subtitle_id=7", "2/fonts?st=opaque&file_id=42"] {
+            let raw = "/api/v2/stream/\(id)/subtitles/" + tail
+            let result = try XCTUnwrap(StreamRequest.resolve(rawURL: raw, serverURL: "https://server.example",
+                additionalHeaders: [:], accessToken: "owner", requiresHeaderAuthenticatedMedia: true, apiV2SessionId: id))
+            XCTAssertEqual(result.url.absoluteString, "https://server.example" + raw)
+            XCTAssertEqual(result.headers["Authorization"], "Bearer owner")
+        }
+        for tail in ["2.vtt", "2.vtt?st=", "2.vtt?st=a&st=b", "2.vtt?st=a&token=b",
+                     "2.vtt?st=a&file_id=-1", "2.vtt?st=a&file_id=1&file_id=2", "../2.vtt?st=a", "2.vtt?st=a#fragment", ""] {
+            XCTAssertNil(StreamRequest.resolve(rawURL: "/api/v2/stream/\(id)/subtitles/" + tail,
+                serverURL: "https://server.example", additionalHeaders: [:], accessToken: "owner",
+                requiresHeaderAuthenticatedMedia: true, apiV2SessionId: id))
+        }
+        XCTAssertNil(StreamRequest.resolve(rawURL: "/api/v2/stream/22222222-2222-4222-8222-222222222222/subtitles/2.vtt?st=a",
+            serverURL: "https://server.example", additionalHeaders: [:], accessToken: "owner",
+            requiresHeaderAuthenticatedMedia: true, apiV2SessionId: id))
     }
 
     func testHeaderAuthenticatedStreamAcceptsSubtitleArtifactIdentifiers() throws {

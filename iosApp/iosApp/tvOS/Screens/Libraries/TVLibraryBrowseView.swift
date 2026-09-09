@@ -22,6 +22,8 @@ struct TVLibraryBrowseView: View {
     let onMoveUp: (() -> Void)?
 
     // MARK: - State
+    @State private var loadGeneration = 0
+    @State private var displayedRead: APIv2LibrarySectionsRead?
 
     @State private var sections: [ResolvedSection] = []
     @State private var isLoadingSections = true
@@ -30,6 +32,11 @@ struct TVLibraryBrowseView: View {
     @Environment(AppRouter.self) private var router
 
     // MARK: - Derived
+
+    private var personalListOwner: LibraryCardAuthority {
+        LibraryCardAuthority(libraryId: library.id,
+            auth: displayedRead?.libraryId == library.id ? displayedRead?.auth : nil)
+    }
 
     private var contentSections: [ResolvedSection] {
         sections.filter { !$0.isFeatured && !$0.items.isEmpty }
@@ -64,6 +71,7 @@ struct TVLibraryBrowseView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .environment(\.libraryCardAuthority, personalListOwner)
         .task { await loadContent() }
     }
 
@@ -85,19 +93,39 @@ struct TVLibraryBrowseView: View {
     // MARK: - Data
 
     private func loadContent() async {
-        if sections.isEmpty,
-           let cached: SectionsResponse = ResponseCache.shared.get(CacheKey.librarySections(library.id)) {
-            sections = cached.sections
+        loadGeneration += 1
+        let generation = loadGeneration
+        let libraryId = library.id
+        if let displayedRead {
+            let current = await StartupContentPrefetcher.librarySectionsAreCurrent(displayedRead, libraryId: libraryId)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            if !current { sections = []; self.displayedRead = nil }
         }
+        if let cached = await StartupContentPrefetcher.cachedLibrarySections(libraryId: libraryId) {
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            sections = cached.sections
+            displayedRead = cached
+        }
+        guard generation == loadGeneration, !Task.isCancelled else { return }
         isLoadingSections = true
         sectionsError = nil
+        defer { if generation == loadGeneration { isLoadingSections = false } }
         do {
-            let response = try await StartupContentPrefetcher.fetchLibrarySections(libraryId: library.id)
-            sections = response.sections
+            let read = try await StartupContentPrefetcher.fetchLibrarySections(libraryId: libraryId)
+            let current = await StartupContentPrefetcher.librarySectionsAreCurrent(read, libraryId: libraryId)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            guard current else { sections = []; return }
+            sections = read.sections
+            displayedRead = read
         } catch {
+            if let displayedRead {
+                let current = await StartupContentPrefetcher.librarySectionsAreCurrent(displayedRead, libraryId: libraryId)
+                guard generation == loadGeneration, !Task.isCancelled else { return }
+                if !current { sections = []; self.displayedRead = nil }
+            }
+            guard generation == loadGeneration, !Task.isCancelled else { return }
             sectionsError = ErrorState(error)
         }
-        isLoadingSections = false
     }
 }
 

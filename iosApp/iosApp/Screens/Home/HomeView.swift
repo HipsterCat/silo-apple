@@ -64,7 +64,9 @@ struct HomeView: View {
                     onTopMenuFocusRequest: onTopMenuFocusRequest,
                     onItemTap: navigateToDetail,
                     onRemoveFromContinueWatching: dismissContinueWatching,
-                    onSetWatched: setWatched
+                    onSetWatched: { [auth = viewModel.personalListAuth] item, played in
+                        await viewModel.setWatched(item, played: played, auth: auth)
+                    }
                 )
                 // Preference edits replace the row band as one stable unit:
                 // the next visible row takes the vacated slot at the fixed
@@ -89,6 +91,17 @@ struct HomeView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .top) {
+            // tvOS has no offline pill; the update-required message still
+            // needs a home, or a v1-only server blocks pilot calls silently.
+            if ConnectionMonitor.shared.isServerUpdateRequired {
+                ServerUpdateRequiredPill()
+                    .padding(.top, 40)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: ConnectionMonitor.shared.isServerUpdateRequired)
         .task {
             homeSectionPreferences.refresh()
             await viewModel.loadSections()
@@ -177,11 +190,19 @@ struct HomeView: View {
                     .padding(.top, 64)
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .zIndex(2)
+            } else if ConnectionMonitor.shared.isServerUpdateRequired {
+                // The server is reachable but v1-only: pilot v2 operations
+                // are refused until it is updated.
+                ServerUpdateRequiredPill()
+                    .padding(.top, 64)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(2)
             }
 
         }
         .animation(.easeInOut(duration: 0.18), value: isRefreshing)
         .animation(.easeInOut(duration: 0.18), value: ConnectionMonitor.shared.isOffline)
+        .animation(.easeInOut(duration: 0.18), value: ConnectionMonitor.shared.isServerUpdateRequired)
         #if !os(macOS)
         .toolbar(.hidden, for: .navigationBar)
         #endif
@@ -199,6 +220,8 @@ struct HomeView: View {
             Task { await viewModel.loadSections() }
         }
         #endif
+        .environment(\.homePersonalListAuth, viewModel.personalListAuth)
+        .environment(\.isHomePersonalListSurface, true)
         .alert(
             "Couldn’t Update Item",
             isPresented: $viewModel.isShowingActionError
@@ -226,7 +249,9 @@ struct HomeView: View {
                         HomeFeedRow(
                             section: section,
                             onRemoveFromContinueWatching: dismissContinueWatching,
-                            onSetWatched: setWatched
+                            onSetWatched: { [auth = viewModel.personalListAuth] item, played in
+                        await viewModel.setWatched(item, played: played, auth: auth)
+                    }
                         )
                         .id(HomeFocusTarget.row(section.id))
                     }
@@ -322,9 +347,6 @@ struct HomeView: View {
         }
     }
 
-    private func setWatched(_ item: SectionItem, played: Bool) async -> Bool {
-        await viewModel.setWatched(item, played: played)
-    }
 
     #if !os(tvOS)
     private var sectionSpacing: CGFloat {

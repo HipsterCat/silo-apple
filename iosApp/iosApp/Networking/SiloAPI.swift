@@ -13,9 +13,14 @@ actor SiloAPI {
     let http: HTTPClient
     private let tokenStore: TokenStore
 
-    init(http: HTTPClient = .shared, tokenStore: TokenStore = .shared) {
+    /// The `/api/v2` pilot operations, on the same transport. v2 has no v1
+    /// fallback: a pilot call that fails stays failed.
+    let v2: APIv2Client
+
+    init(http: HTTPClient = .shared, tokenStore: TokenStore = .shared, v2: APIv2Client? = nil) {
         self.http = http
         self.tokenStore = tokenStore
+        self.v2 = v2 ?? APIv2Client(http: http, tokenStore: tokenStore)
     }
 
     // MARK: - Session state accessors
@@ -58,11 +63,11 @@ actor SiloAPI {
         query.merging(await imageSizeQuery) { caller, _ in caller }
     }
 
-    /// `GET /api/v1/images/capability`. Throws `HTTPError.http(404, _)`
+    /// `GET /api/v2/images/capabilities`. Unavailable
     /// on servers that predate image-size selection; the caller treats
     /// that as "feature off".
     func imageSizeCapability() async throws -> ImageSizeCapabilityResponse {
-        try await http.get("/api/v1/images/capability")
+        try await v2.requestGet("/api/v2/images/capabilities")
     }
 
     // MARK: - Typed endpoint methods
@@ -71,27 +76,44 @@ actor SiloAPI {
 
     // --- Onboarding tour (profile-scoped) ---
 
+    private var onboardingWriter: APIv2OnboardingSession?
+    private var onboardingBusy = false
+
     func onboardingFlow(surface: String) async throws -> OnboardingFlow {
-        try await http.get(
-            "/api/v1/onboarding/flow",
-            query: ["surface": surface]
-        )
+        guard !onboardingBusy else { throw HTTPError.requestIdentityChanged }
+        onboardingBusy = true
+        onboardingWriter = nil
+        defer { onboardingBusy = false }
+        let session = try await v2.onboardingRead(surface: surface)
+        guard var flow = session.flow else { throw APIv2Error.incompleteCollection }
+        onboardingWriter = session
+        flow.writerID = session.id
+        flow.acknowledgedState = session.state
+        return flow
     }
 
     func onboardingState() async throws -> OnboardingState {
-        try await http.get("/api/v1/onboarding/state")
+        try await v2.onboardingRead().state
     }
 
     func postOnboardingProgress(_ request: OnboardingProgressRequest) async throws {
-        try await http.postVoid("/api/v1/onboarding/progress", body: request)
+        guard !onboardingBusy, let session = onboardingWriter, request.writerID == session.id else {
+            throw APIv2Error.incompleteCollection
+        }
+        onboardingBusy = true
+        onboardingWriter = nil
+        defer { onboardingBusy = false }
+        // Consume before dispatch. Failure/412/uncertainty requires a fresh read,
+        // and can never replay the old operation under a newer validator.
+        onboardingWriter = try await v2.onboardingWrite(request, session: session)
     }
 
     func currentUser() async throws -> UserInfo {
-        let user: AuthUser = try await http.get("/api/v1/auth/me")
+        let account = try await v2.currentUser()
         return UserInfo(
-            id: String(user.id),
-            username: user.username,
-            isAdmin: user.role == "admin"
+            id: account.id,
+            username: account.username,
+            isAdmin: account.role == .admin
         )
     }
 
@@ -135,56 +157,48 @@ actor SiloAPI {
     /// switch and the optional baseline `card_overlays` defaults for
     /// users who haven't customized yet. Cached server-side for 60s.
     func overlayConfig() async throws -> OverlayConfigResponse {
-        try await http.get("/api/v1/settings/overlay-config")
+        try SettingsWireCoding.makeDecoder().decode(OverlayConfigResponse.self,
+            from: await v2.settingsRead("/api/v2/settings/overlay-config"))
     }
 
     // --- Home / sections ---
 
-    func homeSections() async throws -> SectionsResponse {
-        try await http.get("/api/v1/home/sections", query: await imageSizeQuery)
+    func homeSections(auth: CapturedOrdinaryRequestAuth?) async throws -> SectionsResponse {
+        guard let auth else { throw HTTPError.requestIdentityChanged }
+        return try await v2.homeSections(imageSize: await imageSizeQuery["image_size"], auth: auth)
     }
 
-    func dismissContinueWatchingItem(contentId: String, progressUpdatedAt: String) async throws {
-        try await http.putVoid(
-            "/api/v1/home/dismissals/continue_watching/\(contentId)",
-            body: HomeDismissalBody(progressUpdatedAt: progressUpdatedAt)
-        )
+    func dismissContinueWatchingItem(contentId: String, progressUpdatedAt: String,
+                                     auth: CapturedOrdinaryRequestAuth?) async throws {
+        try await v2.dismissHomeItem(id: contentId, progressUpdatedAt: progressUpdatedAt, seriesId: nil, auth: auth)
     }
 
-    /// Next Up episodes carry no progress row, so the server keys their
-    /// dismissal on the parent series instead of `progress_updated_at`.
-    func dismissNextUpItem(contentId: String, seriesId: String) async throws {
-        try await http.putVoid(
-            "/api/v1/home/dismissals/next_up/\(contentId)",
-            body: NextUpDismissalBody(seriesId: seriesId)
-        )
+    func dismissNextUpItem(contentId: String, seriesId: String,
+                           auth: CapturedOrdinaryRequestAuth?) async throws {
+        try await v2.dismissHomeItem(id: contentId, progressUpdatedAt: nil, seriesId: seriesId, auth: auth)
     }
 
-    func librarySections(libraryId: Int) async throws -> SectionsResponse {
-        try await http.get("/api/v1/library/\(libraryId)/sections", query: await imageSizeQuery)
+    func librarySections(libraryId: Int, auth: CapturedOrdinaryRequestAuth) async throws -> APIv2LibrarySectionsRead {
+        try await v2.librarySections(id: libraryId, imageSize: await imageSizeQuery["image_size"], auth: auth)
     }
 
-    /// Fetch the IDs of items the recommendation engine considers
-    /// similar to `contentId`. The server returns scored IDs only —
-    /// resolve each into a poster card via `itemDetail` (in parallel).
-    func recommendationsSimilar(
-        contentId: String,
-        limit: Int = 12
-    ) async throws -> [ScoredItemRef] {
-        let response: ScoredItemsResponse = try await http.get(
-            "/api/v1/recommendations/similar/\(contentId)",
-            query: ["limit": String(limit)]
-        )
-        return response.items
+    func itemDetail(contentId: String, auth: CapturedOrdinaryRequestAuth) async throws -> ItemDetail {
+        try await ItemDetail(catalog: v2.catalogItem(id: contentId, imageSize: await imageSizeQuery["image_size"], auth: auth))
     }
 
-    func recommendationsDiscover() async throws -> SectionsResponse {
-        let response: DiscoverResponse = try await http.get("/api/v1/recommendations/discover")
-        let resolved = response.rows.enumerated().map { index, row -> ResolvedSection in
+    /// Ordered viewer-authorized cards; v2 needs no per-item detail hydration.
+    func recommendationsSimilar(contentId: String, limit: Int = 12,
+                                auth: CapturedOrdinaryRequestAuth) async throws -> [BrowseItem] {
+        try await v2.similarCards(id: contentId, limit: limit, auth: auth)
+    }
+
+    func recommendationsDiscover(auth: CapturedOrdinaryRequestAuth) async throws -> SectionsResponse {
+        let rows = try await v2.discover(auth: auth)
+        let resolved = rows.enumerated().map { index, row -> ResolvedSection in
             ResolvedSection(
                 id: "discover_\(index)_\(row.type)",
                 sectionType: row.type,
-                title: row.label,
+                title: row.title,
                 featured: false,
                 itemLimit: row.items.count,
                 totalCount: row.items.count,
@@ -202,86 +216,76 @@ actor SiloAPI {
     /// `end` are inclusive "YYYY-MM-DD" bounds (the server caps the
     /// window at 31 days); `timezone` is the viewer's IANA identifier
     /// used for day grouping.
-    func calendarEvents(
-        start: String,
-        end: String,
-        filter: String,
-        timezone: String
-    ) async throws -> CalendarResponse {
-        try await http.get("/api/v1/calendar", query: [
-            "start": start,
-            "end": end,
-            "filter": filter,
-            "timezone": timezone,
-        ])
+    func calendarEvents(start: String, end: String, filter: String, timezone: String,
+                        auth: CapturedOrdinaryRequestAuth) async throws -> CalendarResponse {
+        try await v2.calendar(start: start, end: end, filter: filter, timezone: timezone, auth: auth)
     }
 
     // --- Catalog ---
 
-    /// Every catalog-shaped list (browse, search, person credits,
-    /// collection items, section paging) funnels through here, so the
-    /// image-size entry only has to be merged in once.
-    func catalog(query: [String: String]) async throws -> CatalogResponse {
-        try await http.get("/api/v1/catalog", query: await withImageSize(query))
-    }
-
-    func historyCatalog(
-        offset: Int,
-        limit: Int,
-        snapshot: String? = nil,
-        includeTotal: Bool = true
-    ) async throws -> CatalogResponse {
-        var query: [String: String] = [
-            "source": "history",
-            "offset": String(offset),
-            "limit": String(limit),
-        ]
-        if let snapshot { query["snapshot"] = snapshot }
-        if !includeTotal { query["include_total"] = "false" }
-        return try await catalog(query: query)
+    func catalogPage(query: APIv2CatalogQuery, operation: APIv2CatalogOperation = .get,
+                     auth suppliedAuth: CapturedOrdinaryRequestAuth? = nil) async throws -> APIv2CatalogResult {
+        let captured = await tokenStore.captureOrdinaryRequestAuth()
+        guard let auth = suppliedAuth ?? captured else {
+            throw HTTPError.requestIdentityChanged
+        }
+        var query = query
+        if query.imageSize == nil { query.imageSize = await imageSizeQuery["image_size"] }
+        return try await v2.catalogPage(query: query, operation: operation, auth: auth)
     }
 
     func itemDetail(contentId: String) async throws -> ItemDetail {
-        try await http.get("/api/v1/catalog/items/\(contentId)", query: await imageSizeQuery)
+        let value = try await v2.catalogItem(id: contentId, imageSize: await imageSizeQuery["image_size"])
+        return try ItemDetail(catalog: value)
     }
 
-    func catalogFilters(libraryId: Int?, includeTechnical: Bool = true) async throws -> CatalogFilters {
-        var query: [String: String] = [:]
-        if let libraryId { query["library_id"] = String(libraryId) }
-        // include_technical unlocks the resolution / audio / subtitle facets.
-        if includeTechnical { query["include_technical"] = "true" }
-        return try await http.get("/api/v1/catalog/filters", query: query)
+    private var seasonListIncludesArtwork: Bool {
+        #if os(tvOS)
+        // tvOS season selectors display labels and do not use season posters.
+        false
+        #else
+        true
+        #endif
+    }
+
+    func seasons(seriesId: String, auth: CapturedOrdinaryRequestAuth) async throws -> SeasonsResponse {
+        let items = try await v2.catalogSeasons(seriesId: seriesId,
+            imageSize: await imageSizeQuery["image_size"], includeArtwork: seasonListIncludesArtwork, auth: auth)
+        return try SeasonsResponse(catalog: items)
     }
 
     func seasons(seriesId: String) async throws -> SeasonsResponse {
-        var query = await imageSizeQuery
-        #if os(tvOS)
-        // tvOS season selectors display labels and do not use season posters.
-        query["include_artwork"] = "false"
-        #endif
-        return try await http.get(
-            "/api/v1/catalog/series/\(seriesId)/seasons",
-            query: query
-        )
+        let items = try await v2.catalogSeasons(seriesId: seriesId, imageSize: await imageSizeQuery["image_size"], includeArtwork: seasonListIncludesArtwork)
+        return try SeasonsResponse(catalog: items)
+    }
+
+    func episodes(seriesId: String, seasonNumber: Int, auth: CapturedOrdinaryRequestAuth) async throws -> EpisodesResponse {
+        let items = try await v2.catalogEpisodes(seriesId: seriesId, seasonNumber: seasonNumber,
+            imageSize: await imageSizeQuery["image_size"], auth: auth)
+        return try EpisodesResponse(catalog: items)
     }
 
     func episodes(seriesId: String, seasonNumber: Int) async throws -> EpisodesResponse {
-        try await http.get(
-            "/api/v1/catalog/series/\(seriesId)/seasons/\(seasonNumber)/episodes",
-            query: await imageSizeQuery
-        )
+        let items = try await v2.catalogEpisodes(seriesId: seriesId, seasonNumber: seasonNumber,
+                                                 imageSize: await imageSizeQuery["image_size"])
+        return try EpisodesResponse(catalog: items)
     }
 
     func watchDetail(contentId: String) async throws -> WatchDetail {
-        try await http.get("/api/v1/watch/\(contentId)", query: await imageSizeQuery)
+        guard let auth = await tokenStore.captureOrdinaryRequestAuth() else { throw HTTPError.requestIdentityChanged }
+        return try await v2.watchDetail(id: contentId, imageSize: await imageSizeQuery["image_size"], auth: auth)
     }
 
     func person(id: Int) async throws -> Person {
-        try await http.get("/api/v1/people/\(id)")
+        try await Person(catalog: v2.catalogPerson(id: String(id)))
     }
 
-    func refreshPerson(id: Int) async throws -> PersonRefreshQueuedResponse {
-        try await http.post("/api/v1/people/\(id)/refresh")
+    func person(id: Int, auth: CapturedOrdinaryRequestAuth) async throws -> Person {
+        try await Person(catalog: v2.catalogPerson(id: id, auth: auth))
+    }
+
+    func refreshPerson(id: Int, auth: CapturedOrdinaryRequestAuth) async throws -> PersonRefreshQueuedResponse {
+        try await v2.refreshPerson(id: id, auth: auth)
     }
 
     /// Ask the server to look for trailers for a movie or series.
@@ -295,127 +299,76 @@ actor SiloAPI {
     ///
     /// There is no job id: observe completion by re-fetching item detail
     /// until `videos` / `extras` change — see ``TrailerFetchCoordinator``.
-    func requestTrailersRefresh(contentId: String) async throws -> TrailerRefreshResponse {
-        try await http.post("/api/v1/items/\(contentId)/trailers/refresh")
+    func requestTrailersRefresh(contentId: String, auth: CapturedOrdinaryRequestAuth) async throws -> TrailerRefreshResponse {
+        try await v2.refreshTrailers(id: contentId, auth: auth)
     }
 
-    func personCatalogItems(
-        personId: Int,
-        type: String?,
-        offset: Int,
-        limit: Int,
-        snapshot: String? = nil
-    ) async throws -> CatalogResponse {
-        var query: [String: String] = [
-            "source": "person",
-            "person_id": String(personId),
-            "offset": String(offset),
-            "limit": String(limit),
-            "sort": "year",
-            "order": "desc",
-        ]
-        if let type { query["type"] = type }
-        if let snapshot { query["snapshot_at"] = snapshot }
-        return try await catalog(query: query)
+    func trailerItemDetail(contentId: String, auth: CapturedOrdinaryRequestAuth) async throws -> ItemDetail {
+        try await ItemDetail(catalog: v2.trailerItem(id: contentId,
+            imageSize: await imageSizeQuery["image_size"], auth: auth))
     }
 
     // --- Libraries ---
 
     func libraries() async throws -> LibrariesResponse {
-        let libs: [Library] = try await http.get("/api/v1/user/libraries")
+        let libs = try await v2.userLibraries().map { try Library(v2: $0) }
         return LibrariesResponse(libraries: libs)
     }
 
     func libraryCollections(libraryId: Int) async throws -> LibraryCollectionsResponse {
-        let wire: LibraryCollectionsWireResponse = try await http.get(
-            "/api/v1/library/\(libraryId)/collections"
-        )
-        return LibraryCollectionsResponse(collections: wire.collections, sections: wire.sections)
+        let wire = try await v2.libraryCollectionTab(libraryId: String(libraryId))
+        let flat = wire.collections.map {
+            LibraryCollection(id: $0.id, name: $0.title, collectionType: $0.collectionType,
+                              itemCount: $0.itemCount, posterUrl: $0.posterUrl, posterThumbhash: $0.posterThumbhash, kind: .regular)
+        }
+        func cards(_ values: [APIv2LibraryCollectionCard], kind: LibraryCollectionKind) -> [LibraryCollection] {
+            values.map { LibraryCollection(id: $0.id, name: $0.title, itemCount: $0.itemCount,
+                posterUrl: $0.posterUrl, posterThumbhash: $0.posterThumbhash, kind: kind, creatorProfileId: $0.creatorProfileId) }
+        }
+        var sections = wire.groups.compactMap { group -> LibraryCollectionSection? in
+            let kind: LibraryCollectionKind
+            switch group.kind {
+            case "admin": kind = .regular
+            case "user_collections": kind = .userCollections
+            default: return nil
+            }
+            return LibraryCollectionSection(id: group.id, name: group.name, kind: kind, collections: cards(group.collections, kind: kind))
+        }
+        if let ungrouped = wire.ungrouped, !ungrouped.collections.isEmpty {
+            let section = LibraryCollectionSection(id: "__ungrouped__", name: "", kind: .regular,
+                                                   collections: cards(ungrouped.collections, kind: .regular))
+            let position = wire.groups.filter { $0.sortOrder <= ungrouped.sortOrder }.count
+            sections.insert(section, at: min(position, sections.count))
+        }
+        return LibraryCollectionsResponse(collections: flat, sections: sections)
     }
 
-    func libraryCollectionItems(
-        libraryId: Int,
-        collectionId: String,
-        offset: Int = 0,
-        limit: Int = 60,
-        snapshot: String? = nil,
-        includeTotal: Bool = false
-    ) async throws -> CatalogResponse {
-        try await catalogCollectionItems(
-            kind: .regular,
-            collectionId: collectionId,
-            offset: offset,
-            limit: limit,
-            snapshot: snapshot,
-            includeTotal: includeTotal
-        )
-    }
-
-    /// User-collection items resolved through the unified catalog endpoint.
-    /// The raw `/api/v1/collections/{id}/items` route returns un-hydrated
-    /// join records; only the catalog resolver re-hydrates them into the
-    /// `CatalogResponse` shape that views expect.
-    func userCollectionItems(
-        collectionId: String,
-        offset: Int = 0,
-        limit: Int = 60,
-        snapshot: String? = nil,
-        includeTotal: Bool = false
-    ) async throws -> CatalogResponse {
-        try await catalogCollectionItems(
-            kind: .userCollections,
-            collectionId: collectionId,
-            offset: offset,
-            limit: limit,
-            snapshot: snapshot,
-            includeTotal: includeTotal
-        )
-    }
-
-    private func catalogCollectionItems(
-        kind: LibraryCollectionKind,
-        collectionId: String,
-        offset: Int,
-        limit: Int,
-        snapshot: String?,
-        includeTotal: Bool
-    ) async throws -> CatalogResponse {
-        var query: [String: String] = [
-            "source": kind.catalogSource,
-            "collection_id": collectionId,
-            "offset": String(offset),
-            "limit": String(limit),
-        ]
-        if let snapshot { query["snapshot"] = snapshot }
-        if !includeTotal { query["include_total"] = "false" }
-        return try await catalog(query: query)
+    /// Fully hydrated personal collection cards, using bounded v2 cursor pages.
+    func userCollectionItems(collectionId: String) async throws -> CatalogResponse {
+        try await v2.personalCollectionCards(id: collectionId)
     }
 
     // --- Playback preferences ---
 
-    func setSubtitlePref(seriesId: String, body: SubtitlePrefRequest) async throws {
-        try await http.putVoid("/api/v1/subtitle-prefs/\(seriesId)", body: body)
+    func setSubtitlePref(seriesId: String, body: SubtitlePrefRequest, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.writeTrackPreference(kind: "subtitle", seriesId: seriesId, body: body, auth: auth)
     }
 
-    func deleteSubtitlePref(seriesId: String) async throws {
-        try await http.delete("/api/v1/subtitle-prefs/\(seriesId)")
+    func deleteSubtitlePref(seriesId: String, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.deleteTrackPreference(kind: "subtitle", seriesId: seriesId, auth: auth)
     }
 
-    func setAudioPref(seriesId: String, body: AudioPrefRequest) async throws {
-        try await http.putVoid("/api/v1/audio-prefs/\(seriesId)", body: body)
+    func setAudioPref(seriesId: String, body: AudioPrefRequest, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.writeTrackPreference(kind: "audio", seriesId: seriesId, body: body, auth: auth)
     }
 
-    func deleteAudioPref(seriesId: String) async throws {
-        try await http.delete("/api/v1/audio-prefs/\(seriesId)")
+    func deleteAudioPref(seriesId: String, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.deleteTrackPreference(kind: "audio", seriesId: seriesId, auth: auth)
     }
 
     // --- Personal data ---
 
-    // These three build their own query rather than routing through
-    // `catalog(query:)`, so each merges the image-size entry itself.
-    // They back real poster grids on TV, and `historyCatalog` — the
-    // entry point the history screen actually uses — is already covered
-    // by `catalog(query:)`.
+    // Standalone personal-list transports remain outside catalog browsing.
 
     func favorites(offset: Int, limit: Int) async throws -> CatalogResponse {
         try await http.get("/api/v1/favorites", query: await withImageSize([
@@ -438,15 +391,16 @@ actor SiloAPI {
         ]))
     }
 
-    /// Server returns 204 when the item is a favorite and 404 otherwise.
-    /// ``HTTPClient/exists(_:query:)`` translates that into a boolean
-    /// without trying to decode the empty response body.
-    func isFavorite(contentId: String) async throws -> Bool {
-        try await http.exists("/api/v1/favorites/\(contentId)")
+    func isFavorite(contentId: String, auth: CapturedOrdinaryRequestAuth?) async throws -> Bool {
+        try await v2.personalMembership(id: contentId, watchlist: false, auth: auth)
     }
 
-    func isInWatchlist(contentId: String) async throws -> Bool {
-        try await http.exists("/api/v1/watchlist/\(contentId)")
+    func isInWatchlist(contentId: String, auth: CapturedOrdinaryRequestAuth?) async throws -> Bool {
+        try await v2.personalMembership(id: contentId, watchlist: true, auth: auth)
+    }
+
+    func toggleFavorite(contentId: String, isFavorite: Bool, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.setFavoriteMembership(id: contentId, included: isFavorite, auth: auth)
     }
 
     func toggleFavorite(contentId: String, isFavorite: Bool) async throws {
@@ -455,6 +409,11 @@ actor SiloAPI {
         } else {
             try await http.delete("/api/v1/favorites/\(contentId)")
         }
+    }
+
+    /// The detail screen carries its observed owner; shared card actions migrate separately.
+    func toggleWatchlist(contentId: String, isInWatchlist: Bool, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.setWatchlistMembership(id: contentId, included: isInWatchlist, auth: auth)
     }
 
     func toggleWatchlist(contentId: String, isInWatchlist: Bool) async throws {
@@ -467,6 +426,10 @@ actor SiloAPI {
 
     /// Mark a content item (movie / series / season / episode) as watched
     /// or unwatched. Server resolves the leaf targets.
+    func setWatched(contentId: String, played: Bool, auth: CapturedOrdinaryRequestAuth) async throws {
+        try await v2.setWatchedState(id: contentId, included: played, auth: auth)
+    }
+
     func setWatched(contentId: String, played: Bool) async throws {
         if played {
             try await http.postVoid("/api/v1/watched/\(contentId)")
@@ -478,65 +441,64 @@ actor SiloAPI {
     // --- Collections ---
 
     func collections() async throws -> CollectionsResponse {
-        try await http.get("/api/v1/collections")
+        let response: PersonalCollectionsV2 = try await v2.requestGet("/api/v2/collections")
+        return CollectionsResponse(collections: response.items, groups: response.groups)
     }
 
-    func collectionItems(
-        collectionId: String,
-        offset: Int,
-        limit: Int
-    ) async throws -> CatalogResponse {
-        try await http.get("/api/v1/collections/\(collectionId)/items", query: [
-            "offset": String(offset),
-            "limit": String(limit),
-        ])
+    func collectionItems(collectionId: String) async throws -> CatalogResponse {
+        try await userCollectionItems(collectionId: collectionId)
     }
 
     func createCollection(name: String, collectionType: String) async throws -> UserCollection {
-        try await http.post(
-            "/api/v1/collections",
+        try await v2.requestPost(
+            "/api/v2/collections",
             body: CreateCollectionRequest(name: name, collectionType: collectionType)
         )
     }
 
-    func deleteCollection(id: String) async throws {
-        try await http.delete("/api/v1/collections/\(id)")
+    func collectionCapabilities() async throws -> CollectionCapabilitiesV2 {
+        try await v2.requestGet("/api/v2/collections/capabilities")
     }
 
-    /// Move a personal collection between groups (pass `nil` for
-    /// Ungrouped). Returns the updated collection.
-    func moveCollectionToGroup(id: String, groupId: String?) async throws -> UserCollection {
-        try await http.put(
-            "/api/v1/collections/\(id)",
-            body: UpdateUserCollectionGroupBody(groupId: groupId)
-        )
+    func collectionEditor(id: String) async throws -> CollectionEditor<UserCollection> {
+        try await v2.collectionEditor("/api/v2/collections/\(id)")
+    }
+
+    func collectionGroupEditor(id: String) async throws -> CollectionEditor<CollectionGroup> {
+        try await v2.collectionEditor("/api/v2/collections/groups/\(id)")
+    }
+
+    func deleteCollection(version: CollectionEditVersion) async throws {
+        try await v2.deleteCollection(version: version)
+    }
+
+    func moveCollectionToGroup(version: CollectionEditVersion, groupId: String?) async throws -> UserCollection {
+        try await v2.mutateCollection(method: "PATCH", version: version,
+            body: UpdateUserCollectionGroupBody(groupId: groupId))
     }
 
     // --- Collection groups (personal) ---
 
     func createCollectionGroup(name: String) async throws -> CollectionGroup {
-        try await http.post(
-            "/api/v1/collections/groups",
+        try await v2.requestPost(
+            "/api/v2/collections/groups",
             body: CreateCollectionGroupRequest(name: name, slug: nil)
         )
     }
 
-    func renameCollectionGroup(id: String, name: String) async throws -> CollectionGroup {
-        try await http.put(
-            "/api/v1/collections/groups/\(id)",
-            body: UpdateCollectionGroupRequest(name: name)
-        )
+    func renameCollectionGroup(version: CollectionEditVersion, name: String) async throws -> CollectionGroup {
+        try await v2.mutateCollection(method: "PATCH", version: version,
+            body: UpdateCollectionGroupRequest(name: name))
     }
 
-    func deleteCollectionGroup(id: String) async throws {
-        try await http.delete("/api/v1/collections/groups/\(id)")
+    func deleteCollectionGroup(version: CollectionEditVersion) async throws {
+        try await v2.deleteCollection(version: version)
     }
 
     // --- Profiles ---
 
     func listProfiles() async throws -> [UserProfile] {
-        let response: ProfilesResponse = try await http.get("/api/v1/profiles")
-        return response.profiles.map(\.asUserProfile)
+        try await v2.householdProfiles()
     }
 
     /// Verifies a protected profile without mutating process-wide identity.
@@ -549,10 +511,7 @@ actor SiloAPI {
         // with 400. Mirrors `ProfileSelectionViewModel.onProfileTapped` on
         // Android, which skips the verify call when `hasPin` is false.
         if let pin, !pin.isEmpty {
-            let response: VerifyPinResponse = try await http.post(
-                "/api/v1/profiles/\(profileId)/verify-pin",
-                body: VerifyPinRequest(pin: pin)
-            )
+            let response = try await v2.verifyHouseholdPIN(id: profileId, pin: pin)
             guard response.valid else {
                 throw APIError.httpError(statusCode: 401)
             }
@@ -570,9 +529,8 @@ actor SiloAPI {
         libraryRestrictionsEnabled: Bool = false,
         allowedLibraryIds: [Int] = []
     ) async throws -> UserProfile {
-        let profile: Profile = try await http.post(
-            "/api/v1/profiles",
-            body: CreateProfileRequestBody(
+        return try await v2.createHouseholdProfile(
+            CreateProfileRequestBody(
                 name: name,
                 avatar: avatarEmoji,
                 pin: pin,
@@ -582,14 +540,13 @@ actor SiloAPI {
                 allowedLibraryIds: allowedLibraryIds
             )
         )
-        return profile.asUserProfile
     }
 
     /// Patch a profile. Send only the fields you want to change — the
     /// server treats absent fields as untouched. Used by Settings to
     /// persist subtitle prefs.
     func updateProfile(profileId: String, body: UpdateProfileBody) async throws {
-        try await http.putVoid("/api/v1/profiles/\(profileId)", body: body)
+        _ = try await v2.updateProfile(id: profileId, patch: body.asAPIv2Patch)
     }
 
     // --- Playback ---
@@ -599,8 +556,16 @@ actor SiloAPI {
     }
 
     // Stream probing and transcode startup can exceed the standard request timeout.
-    func startPlaybackV3(request: PlaybackV3StartRequest) async throws -> PlaybackV3DecisionResponse {
-        try await http.post("/api/v1/playback/start", body: request, timeout: .extended)
+    func startPlaybackV3(request: PlaybackV3StartRequest, auth: CapturedOrdinaryRequestAuth? = nil) async throws -> PlaybackV3DecisionResponse {
+        guard let auth else { return try await http.post("/api/v1/playback/start", body: request, timeout: .extended) }
+        guard let profile = auth.profileId, request.profileId == profile else { throw HTTPError.requestIdentityChanged }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let identity = HTTPRequestIdentity(serverId: auth.account.serverId, serverURL: auth.account.serverURL,
+            profileId: profile, clientFamily: AppleDeviceIdentity.current.clientFamily)
+        let response = try await http.requestData(method: "POST", path: "/api/v1/playback/start",
+            body: encoder.encode(request), timeout: .extended, requestIdentity: identity, expectedAccount: auth.account)
+        return try HTTPClient.makeJSONDecoder().decode(PlaybackV3DecisionResponse.self, from: response.data)
     }
 
     func replanPlaybackV3(

@@ -478,6 +478,7 @@ final class PlayerSettings {
     /// Debounced writer for the canonical settings API. Owns the queue, the
     /// mutation ids and the retry schedule; see PlayerSettingsFlusher.swift.
     private let flusher: PlayerSettingsFlusher
+    var remoteSaveIssue: String? { flusher.saveIssue }
 
     /// Designated initializer, non-private so tests can build an instance with
     /// an isolated `UserDefaults` and a fake transport rather than reaching for
@@ -604,6 +605,18 @@ final class PlayerSettings {
         subtitleSystemSelectionPreferences = SystemCaptionSelectionPreferences.current()
     }
 
+    /// Onboarding reconciles only the flow's captured owner. This path does
+    /// not restore caches, flush queues, import legacy values, or create writes.
+    @MainActor
+    func refreshFromServer(owner: CapturedDurableAccountAuth, api: SiloAPI = .shared,
+                           tokens: TokenStore = .shared, journal: SettingsMutationJournal? = nil) async throws {
+        let settings = CanonicalProfileSettingsV2(api: api, tokens: tokens, journal: journal)
+        try await settings.requireCurrent(owner)
+        let response = try await settings.read(SettingKey.playerDeviceSettings, owner: owner)
+        try await settings.requireCurrent(owner)
+        applyEffectiveSettings(response.byKey)
+    }
+
     /// Pull every synced setting from the server and adopt it.
     ///
     /// One batched call: the server resolves all seventeen keys in a single
@@ -634,7 +647,7 @@ final class PlayerSettings {
             let effectiveByKey = response.byKey
             applyEffectiveSettings(effectiveByKey)
 
-            if let scopeID, !isMigrationComplete(for: scopeID) {
+            if flusher.permitsLegacyImport, let scopeID, !isMigrationComplete(for: scopeID) {
                 let imported = await importLegacySettingsIfNeeded(
                     scopeID: scopeID,
                     legacySnapshot: legacySnapshot,

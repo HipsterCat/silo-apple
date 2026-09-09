@@ -117,7 +117,8 @@ final class SubtitleAIControllerTests: XCTestCase {
             liveCoordinator: coordinator,
             handoffContext: {
                 SubtitleAIController.HandoffContext(
-                    sessionId: "sess-1",
+                    sessionId: "11111111-1111-4111-8111-111111111111",
+                    executorReference: "signed-proof",
                     baseTrackCount: 3,
                     resolveURL: { path in URL(string: "https://host\(path)") }
                 )
@@ -375,6 +376,21 @@ final class SubtitleAIControllerTests: XCTestCase {
     /// in order once the accepted job lands — so the coordinator engages the
     /// live cue experience (preparing → streaming) even on a fast LAN where the
     /// websocket beats the HTTP response.
+    func testBackgroundAcceptanceDropsEarlyLiveFramesAndResumesPlayback() async {
+        let h = makeHarness(downloaded: [])
+        h.controller.beginSubmitWindowForTesting()
+        h.controller.handle(started("ai-77"))
+        h.controller.handle(cues("ai-77"))
+        h.controller.seedAcceptedJobForTesting(runningJob(id: "77"), liveDeliveryAttached: false)
+        XCTAssertEqual(h.controller.phase, .running)
+        XCTAssertEqual(h.controller.bufferedEarlyFrameCountForTesting, 0)
+        XCTAssertFalse(h.controller.livePresentationActive)
+        XCTAssertTrue(h.controls.isPlaying)
+        h.controller.handle(started("ai-77"))
+        h.controller.handle(cues("ai-77"))
+        XCTAssertFalse(h.controller.livePresentationActive)
+    }
+
     func testEarlyFramesBeforeAcceptAreBufferedThenReplayed() async {
         let h = makeHarness(downloaded: [persisted(id: 99)])
 

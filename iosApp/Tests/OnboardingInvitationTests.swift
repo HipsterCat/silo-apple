@@ -9,13 +9,16 @@ final class OnboardingInvitationTests: XCTestCase {
 
     func testOnboardingSurfaceUsesAQueryItemInsteadOfEmbeddingQueryInPath() async throws {
         let (http, tokenStore) = await makeHTTPClient(activeURL: "https://active.example/silo")
-        let api = SiloAPI(http: http, tokenStore: tokenStore)
+        try await tokenStore.installAccountSession(accessToken: "existing-access", refreshToken: "existing-refresh", accountID: "account")
+        await tokenStore.setProfileId("profile")
+        let api = SiloAPI(http: http, tokenStore: tokenStore,
+            v2: APIv2Client(http: http, tokenStore: tokenStore, isUpdateRequired: { false }))
 
         let flow = try await api.onboardingFlow(surface: "phone")
         XCTAssertEqual(flow.tourId, "tour-test")
 
         let request = try XCTUnwrap(OnboardingRequestStubProtocol.requests().last)
-        XCTAssertEqual(request.url?.path, "/silo/api/v1/onboarding/flow")
+        XCTAssertEqual(request.url?.path, "/silo/api/v2/onboarding/flow")
         XCTAssertEqual(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
             .queryItems, [URLQueryItem(name: "surface", value: "phone")])
     }
@@ -77,6 +80,30 @@ final class OnboardingInvitationTests: XCTestCase {
         XCTAssertNil(model.selectedValues["failed"])
         XCTAssertNotNil(model.error)
         XCTAssertFalse(model.finished)
+    }
+
+    @MainActor
+    func testInitialLoadFailureCanRetryWithoutProgressReplay() async {
+        let api = OnboardingTourAPIStub(flowFailures: 1, flow: Self.flow(steps: [Self.welcomeStep(id: "welcome")]))
+        let model = OnboardingTourViewModel(api: api)
+
+        await model.load()
+        XCTAssertFalse(model.isLoading)
+        XCTAssertTrue(model.steps.isEmpty)
+        XCTAssertNotNil(model.error)
+        XCTAssertFalse(model.finished)
+        let failedEvents = await api.events()
+        XCTAssertTrue(failedEvents.isEmpty)
+
+        await model.load()
+        XCTAssertFalse(model.isLoading)
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.steps.map(\.id), ["welcome"])
+        XCTAssertFalse(model.finished)
+        let calls = await api.flowCalls()
+        let recoveredEvents = await api.events()
+        XCTAssertEqual(calls, 2)
+        XCTAssertTrue(recoveredEvents.isEmpty)
     }
 
     @MainActor
@@ -248,29 +275,42 @@ final class OnboardingInvitationTests: XCTestCase {
 }
 
 private actor OnboardingTourAPIStub: OnboardingTourAPI {
+    func requireCurrentFlowOwner() async throws {}
+    func flowSettingsOwner() async throws -> CapturedDurableAccountAuth? { nil }
     private var recordedWrites: [String] = []
     private var recordedEvents: [String] = []
     private var recordedProfileUpdates: [String] = []
     private let failWrites: Bool
     private let failProgress: Bool
     private let flow: OnboardingFlow
+    private var flowFailures: Int
+    private var flowReadCount = 0
 
     init(
         failWrites: Bool = false,
         failProgress: Bool = false,
+        flowFailures: Int = 0,
         flow: OnboardingFlow = OnboardingFlow(version: 1, tourId: "tour", steps: [])
     ) {
         self.failWrites = failWrites
         self.failProgress = failProgress
         self.flow = flow
+        self.flowFailures = flowFailures
     }
 
     func writes() -> [String] { recordedWrites }
     func events() -> [String] { recordedEvents }
     func profileUpdates() -> [String] { recordedProfileUpdates }
 
+    func flowCalls() -> Int { flowReadCount }
+
     func onboardingFlow(surface: String) async throws -> OnboardingFlow {
-        flow
+        flowReadCount += 1
+        if flowFailures > 0 {
+            flowFailures -= 1
+            throw URLError(.cannotConnectToHost)
+        }
+        return flow
     }
 
     func postOnboardingProgress(_ request: OnboardingProgressRequest) async throws {
@@ -301,7 +341,7 @@ private actor OnboardingTourAPIStub: OnboardingTourAPI {
 private final class OnboardingRuntimeSettingsRefresherStub: OnboardingRuntimeSettingsRefreshing {
     private(set) var refreshes: [String] = []
 
-    func refreshAfterProfileWrite(key: String, value: String) async {
+    func refreshAfterProfileWrite(key: String, value: String, owner: CapturedDurableAccountAuth?) async {
         refreshes.append("\(key)=\(value)")
     }
 }
@@ -326,9 +366,12 @@ private final class OnboardingRequestStubProtocol: URLProtocol {
         let path = request.url?.path ?? ""
         let status: Int
         let body: Data
-        if path.hasSuffix("/api/v1/onboarding/flow") {
+        if path.hasSuffix("/api/v2/onboarding/flow") {
             status = 200
             body = Data(#"{"version":1,"tour_id":"tour-test","steps":[]}"#.utf8)
+        } else if path.hasSuffix("/api/v2/onboarding/state") {
+            status = 200
+            body = Data(#"{"tour_id":"tour-test","done":false}"#.utf8)
         } else {
             status = 500
             body = Data()
@@ -338,7 +381,7 @@ private final class OnboardingRequestStubProtocol: URLProtocol {
             url: request.url!,
             statusCode: status,
             httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: ["Content-Type": "application/json", "ETag": "\"rev0\""]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)

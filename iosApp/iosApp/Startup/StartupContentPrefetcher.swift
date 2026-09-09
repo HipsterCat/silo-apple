@@ -32,11 +32,40 @@ enum StartupContentPrefetcher {
     ]
 
     private static var profilesTask: Task<[UserProfile], Error>?
-    private static var homeSectionsTask: Task<SectionsResponse, Error>?
-    private static var recommendationsTask: Task<SectionsResponse, Error>?
+    private static var homeSectionsTask: RecommendationFlight?
+    private static var latestHomeFlight: UUID?
+    private struct RecommendationFlight {
+        let id: UUID
+        let auth: CapturedOrdinaryRequestAuth
+        let task: Task<SectionsResponse, Error>
+    }
+    private struct RecommendationCache {
+        let auth: CapturedOrdinaryRequestAuth
+        let response: SectionsResponse
+    }
+    private static var recommendationsTask: RecommendationFlight?
+    private static var latestRecommendationFlight: UUID?
+
+    static func sameRecommendationOwner(_ a: CapturedOrdinaryRequestAuth, _ b: CapturedOrdinaryRequestAuth) -> Bool {
+        a.account == b.account && a.credentialOwner == b.credentialOwner &&
+            a.profileId == b.profileId && a.profileToken == b.profileToken
+    }
+
+    /// Called only after the caller has checked current authority and its run token.
+    static func cachedRecommendations(auth: CapturedOrdinaryRequestAuth) -> SectionsResponse? {
+        guard let cached: RecommendationCache = ResponseCache.shared.get(CacheKey.recommendations),
+              sameRecommendationOwner(cached.auth, auth) else { return nil }
+        return cached.response
+    }
     private static var userLibrariesTask: Task<LibrariesResponse, Error>?
-    private static var librarySectionsTasks: [Int: Task<SectionsResponse, Error>] = [:]
-    private static var browseFirstPageTasks: [String: Task<CatalogResponse, Error>] = [:]
+    private struct LibrarySectionsFlight {
+        let id: UUID
+        let auth: CapturedOrdinaryRequestAuth
+        let task: Task<APIv2LibrarySectionsRead, Error>
+    }
+    private static var librarySectionsTasks: [Int: LibrarySectionsFlight] = [:]
+    private static var latestLibraryFlight: [Int: UUID] = [:]
+    private static var browseFirstPageTasks: [String: Task<APIv2CatalogResult, Error>] = [:]
     #if os(tvOS)
     /// One bounded cold-start warmup for the Series library the top-level tab
     /// will actually open. This is separate from `librarySectionsTasks`: the
@@ -52,19 +81,22 @@ enum StartupContentPrefetcher {
     static func resetProfileScopedPrefetches() {
         profileScopedGeneration += 1
 
-        homeSectionsTask?.cancel()
-        recommendationsTask?.cancel()
+        homeSectionsTask?.task.cancel()
+        recommendationsTask?.task.cancel()
         userLibrariesTask?.cancel()
-        librarySectionsTasks.values.forEach { $0.cancel() }
+        librarySectionsTasks.values.forEach { $0.task.cancel() }
         browseFirstPageTasks.values.forEach { $0.cancel() }
         #if os(tvOS)
         tvSeriesLandingTasks.values.forEach { $0.cancel() }
         #endif
 
         homeSectionsTask = nil
+        latestHomeFlight = nil
         recommendationsTask = nil
+        latestRecommendationFlight = nil
         userLibrariesTask = nil
         librarySectionsTasks.removeAll()
+        latestLibraryFlight.removeAll()
         browseFirstPageTasks.removeAll()
         #if os(tvOS)
         tvSeriesLandingTasks.removeAll()
@@ -136,8 +168,9 @@ enum StartupContentPrefetcher {
     /// response cache is intentionally left intact for the caller to update.
     static func invalidateHomeSectionsInFlight() {
         homeSectionsGeneration += 1
-        homeSectionsTask?.cancel()
+        homeSectionsTask?.task.cancel()
         homeSectionsTask = nil
+        latestHomeFlight = nil
     }
 
     /// Capture the active profile/server generation when a player is created.
@@ -153,31 +186,57 @@ enum StartupContentPrefetcher {
         }
     }
 
-    static func fetchHomeSections() async throws -> SectionsResponse {
+    static func homeResponseIsCurrent(_ response: SectionsResponse, tokens: TokenStore = .shared) async -> Bool {
+        guard let auth = response.homeReadAuth else { return false }
+        return await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
+    }
+
+    static func cachedHomeSections(tokens: TokenStore = .shared) async -> SectionsResponse? {
         let profileGeneration = profileScopedGeneration
         let homeGeneration = homeSectionsGeneration
-        let requestProfileID = AuthService.shared.profileId
+        guard let response: SectionsResponse = ResponseCache.shared.get(CacheKey.homeSections),
+              await homeResponseIsCurrent(response, tokens: tokens),
+              profileGeneration == profileScopedGeneration, homeGeneration == homeSectionsGeneration else { return nil }
+        return response
+    }
+
+    static func fetchHomeSections(auth original: CapturedOrdinaryRequestAuth? = nil,
+                                  api: SiloAPI = .shared, tokens: TokenStore = .shared) async throws -> SectionsResponse {
+        let profileGeneration = profileScopedGeneration
+        let homeGeneration = homeSectionsGeneration
+        let captured: CapturedOrdinaryRequestAuth?
+        if let original { captured = original }
+        else { captured = await tokens.captureOrdinaryRequestAuth() }
+        guard let auth = captured,
+              await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil else {
+            throw HTTPError.requestIdentityChanged
+        }
+        try validateProfileScopedGeneration(profileGeneration)
+        try validateHomeSectionsGeneration(homeGeneration)
+        try Task.checkCancellation()
         #if os(iOS) || os(tvOS)
         let probe = PrefetchProbe.begin("home_sections", isOriginator: homeSectionsTask == nil)
         #endif
-        let task: Task<SectionsResponse, Error>
-        if let homeSectionsTask {
-            task = homeSectionsTask
+        let flight: RecommendationFlight
+        if let current = homeSectionsTask, sameRecommendationOwner(current.auth, auth) {
+            flight = current
         } else {
-            task = Task {
-                try await SiloAPI.shared.homeSections()
-            }
-            homeSectionsTask = task
+            homeSectionsTask?.task.cancel()
+            flight = RecommendationFlight(id: UUID(), auth: auth, task: Task {
+                try await api.homeSections(auth: auth)
+            })
+            homeSectionsTask = flight
+            latestHomeFlight = flight.id
         }
-
         do {
-            let response = try await task.value
+            let response = try await flight.task.value
+            let current = await homeResponseIsCurrent(response, tokens: tokens)
             try validateProfileScopedGeneration(profileGeneration)
             try validateHomeSectionsGeneration(homeGeneration)
-            if profileScopedGeneration == profileGeneration,
-               homeSectionsGeneration == homeGeneration {
-                homeSectionsTask = nil
-            }
+            try Task.checkCancellation()
+            guard current else { throw HTTPError.requestIdentityChanged }
+            guard latestHomeFlight == flight.id else { throw CancellationError() }
+            if homeSectionsTask?.id == flight.id { homeSectionsTask = nil }
             #if os(iOS) || os(tvOS)
             probe.finish(error: nil)
             #endif
@@ -185,27 +244,24 @@ enum StartupContentPrefetcher {
             prefetchHomeArtwork(for: response)
             return response
         } catch {
-            if profileScopedGeneration == profileGeneration,
-               homeSectionsGeneration == homeGeneration {
-                homeSectionsTask = nil
-            }
-            // Emitted before the recovery call: `recoverFromInvalidProfile`
-            // tears the session down to profile selection, and the breadcrumb
-            // explaining why must precede the transition it causes.
+            if homeSectionsTask?.id == flight.id { homeSectionsTask = nil }
             #if os(iOS) || os(tvOS)
             probe.finish(error: error)
             #endif
-            if let requestProfileID,
-               Self.indicatesInvalidProfile(error) {
-                await AuthService.shared.recoverFromInvalidProfile(
-                    expectedProfileID: requestProfileID
-                )
+            if Self.indicatesInvalidProfile(error),
+               await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil,
+               profileScopedGeneration == profileGeneration, homeSectionsGeneration == homeGeneration,
+               !Task.isCancelled, let profile = auth.profileId {
+                await AuthService.shared.recoverFromInvalidProfile(expectedProfileID: profile)
             }
             throw error
         }
     }
 
     nonisolated static func indicatesInvalidProfile(_ error: Error) -> Bool {
+        if case APIv2Error.problem(let problem) = error {
+            return ["profile_unverified", "profile_not_found"].contains(problem.identifier)
+        }
         guard let error = error as? HTTPError else { return false }
         return ["profile_unverified", "profile_not_found"].contains(error.serverErrorCode)
     }
@@ -370,40 +426,51 @@ enum StartupContentPrefetcher {
         }
     }
 
-    static func fetchRecommendations() async throws -> SectionsResponse {
+    static func fetchRecommendations(auth original: CapturedOrdinaryRequestAuth? = nil,
+                                     api: SiloAPI = .shared, tokens: TokenStore = .shared) async throws -> SectionsResponse {
         let generation = profileScopedGeneration
+        let captured: CapturedOrdinaryRequestAuth?
+        if let original { captured = original }
+        else { captured = await tokens.captureOrdinaryRequestAuth() }
+        guard let auth = captured, auth.profileId != nil,
+              await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil else {
+            throw HTTPError.requestIdentityChanged
+        }
+        try validateProfileScopedGeneration(generation)
+        try Task.checkCancellation()
         #if os(iOS) || os(tvOS)
         let probe = PrefetchProbe.begin("recommendations", isOriginator: recommendationsTask == nil)
         #endif
-        let task: Task<SectionsResponse, Error>
-        if let recommendationsTask {
-            task = recommendationsTask
+        let flight: RecommendationFlight
+        if let current = recommendationsTask, sameRecommendationOwner(current.auth, auth) {
+            flight = current
         } else {
-            task = Task {
-                try await SiloAPI.shared.recommendationsDiscover()
-            }
-            recommendationsTask = task
+            recommendationsTask?.task.cancel()
+            flight = RecommendationFlight(id: UUID(), auth: auth, task: Task {
+                try await api.recommendationsDiscover(auth: auth)
+            })
+            recommendationsTask = flight
+            latestRecommendationFlight = flight.id
         }
-
         do {
-            let response = try await task.value
+            let response = try await flight.task.value
+            let current = await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil
             try validateProfileScopedGeneration(generation)
-            if profileScopedGeneration == generation {
-                recommendationsTask = nil
-            }
+            try Task.checkCancellation()
+            guard current else { throw HTTPError.requestIdentityChanged }
+            guard latestRecommendationFlight == flight.id else { throw CancellationError() }
+            if recommendationsTask?.id == flight.id { recommendationsTask = nil }
             #if os(iOS) || os(tvOS)
             probe.finish(error: nil)
             #endif
-            ResponseCache.shared.set(response, for: CacheKey.recommendations)
+            ResponseCache.shared.set(RecommendationCache(auth: auth, response: response), for: CacheKey.recommendations)
             prefetchSectionArtwork(for: response, maxCount: maxSectionArtworkURLs)
             #if os(tvOS)
             prefetchRecommendationLogos(for: response)
             #endif
             return response
         } catch {
-            if profileScopedGeneration == generation {
-                recommendationsTask = nil
-            }
+            if recommendationsTask?.id == flight.id { recommendationsTask = nil }
             #if os(iOS) || os(tvOS)
             probe.finish(error: error)
             #endif
@@ -484,14 +551,17 @@ enum StartupContentPrefetcher {
             guard let response = try? await fetchLibrarySections(libraryId: libraryId),
                   !Task.isCancelled,
                   profileScopedGeneration == generation,
-                  let item = firstSeriesItem(in: response) else { return }
+                  let item = firstSeriesItem(in: response.response) else { return }
 
             let key = CacheKey.itemDetail(item.contentId)
             if let _: ItemDetail = ResponseCache.shared.get(key) { return }
 
-            guard let detail = try? await MetadataRequestPool.shared.itemDetail(
-                contentId: item.contentId
+            guard await librarySectionsAreCurrent(response, libraryId: libraryId),
+                  !Task.isCancelled, profileScopedGeneration == generation,
+                  let detail = try? await SiloAPI.shared.itemDetail(
+                contentId: item.contentId, auth: response.auth
             ),
+            await librarySectionsAreCurrent(response, libraryId: libraryId),
             !Task.isCancelled,
             profileScopedGeneration == generation else { return }
 
@@ -509,46 +579,60 @@ enum StartupContentPrefetcher {
     }
     #endif
 
-    static func fetchLibrarySections(libraryId: Int) async throws -> SectionsResponse {
-        let generation = profileScopedGeneration
-        // Verbose: these two run once per library on the landing prefetch and
-        // again on every browse navigation, so at essential tier a session's
-        // worth of them would crowd out the launch chain. The library id is
-        // deliberately not recorded — there is no registered key for it, and
-        // it identifies the user's own content.
-        #if os(iOS) || os(tvOS)
-        let probe = PrefetchProbe.begin(
-            "library_sections",
-            verbosity: .verbose,
-            isOriginator: librarySectionsTasks[libraryId] == nil
-        )
-        #endif
-        let task: Task<SectionsResponse, Error>
-        if let existing = librarySectionsTasks[libraryId] {
-            task = existing
-        } else {
-            task = Task {
-                try await SiloAPI.shared.librarySections(libraryId: libraryId)
-            }
-            librarySectionsTasks[libraryId] = task
-        }
+    static func librarySectionsAreCurrent(_ read: APIv2LibrarySectionsRead, libraryId: Int,
+                                         tokens: TokenStore = .shared) async -> Bool {
+        guard read.libraryId == libraryId else { return false }
+        return await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: read.auth) != nil
+    }
 
+    static func cachedLibrarySections(libraryId: Int, tokens: TokenStore = .shared) async -> APIv2LibrarySectionsRead? {
+        let generation = profileScopedGeneration
+        guard let read: APIv2LibrarySectionsRead = ResponseCache.shared.get(CacheKey.librarySections(libraryId)),
+              await librarySectionsAreCurrent(read, libraryId: libraryId, tokens: tokens),
+              profileScopedGeneration == generation else { return nil }
+        return read
+    }
+
+    static func fetchLibrarySections(libraryId: Int, api: SiloAPI = .shared,
+                                     tokens: TokenStore = .shared) async throws -> APIv2LibrarySectionsRead {
+        let generation = profileScopedGeneration
+        guard let auth = await tokens.captureOrdinaryRequestAuth(),
+              await tokens.currentOrdinaryRequestAuth(matchingIdentityOf: auth) != nil else {
+            throw HTTPError.requestIdentityChanged
+        }
+        try validateProfileScopedGeneration(generation)
+        try Task.checkCancellation()
+        #if os(iOS) || os(tvOS)
+        let probe = PrefetchProbe.begin("library_sections", verbosity: .verbose,
+            isOriginator: librarySectionsTasks[libraryId] == nil)
+        #endif
+        let flight: LibrarySectionsFlight
+        if let existing = librarySectionsTasks[libraryId], sameRecommendationOwner(existing.auth, auth) {
+            flight = existing
+        } else {
+            librarySectionsTasks[libraryId]?.task.cancel()
+            flight = LibrarySectionsFlight(id: UUID(), auth: auth, task: Task {
+                try await api.librarySections(libraryId: libraryId, auth: auth)
+            })
+            librarySectionsTasks[libraryId] = flight
+            latestLibraryFlight[libraryId] = flight.id
+        }
         do {
-            let response = try await task.value
+            let read = try await flight.task.value
+            let current = await librarySectionsAreCurrent(read, libraryId: libraryId, tokens: tokens)
             try validateProfileScopedGeneration(generation)
-            if profileScopedGeneration == generation {
-                librarySectionsTasks[libraryId] = nil
-            }
+            try Task.checkCancellation()
+            guard current else { throw HTTPError.requestIdentityChanged }
+            guard latestLibraryFlight[libraryId] == flight.id else { throw CancellationError() }
+            if librarySectionsTasks[libraryId]?.id == flight.id { librarySectionsTasks[libraryId] = nil }
             #if os(iOS) || os(tvOS)
             probe.finish(error: nil)
             #endif
-            ResponseCache.shared.set(response, for: CacheKey.librarySections(libraryId))
-            prefetchSectionArtwork(for: response, maxCount: maxSectionArtworkURLs)
-            return response
+            ResponseCache.shared.set(read, for: CacheKey.librarySections(libraryId))
+            prefetchSectionArtwork(for: read.response, maxCount: maxSectionArtworkURLs)
+            return read
         } catch {
-            if profileScopedGeneration == generation {
-                librarySectionsTasks[libraryId] = nil
-            }
+            if librarySectionsTasks[libraryId]?.id == flight.id { librarySectionsTasks[libraryId] = nil }
             #if os(iOS) || os(tvOS)
             probe.finish(error: error)
             #endif
@@ -565,7 +649,7 @@ enum StartupContentPrefetcher {
     static func fetchBrowseFirstPage(
         libraryId: Int?,
         state: CatalogFilterState = .none
-    ) async throws -> CatalogResponse {
+    ) async throws -> APIv2CatalogResult {
         let generation = profileScopedGeneration
         let key = CacheKey.browse(libraryId: libraryId, filterKey: state.cacheKeyFragment)
         // Verbose for the same reason as `library_sections`, and the cache key
@@ -577,7 +661,7 @@ enum StartupContentPrefetcher {
             isOriginator: browseFirstPageTasks[key] == nil
         )
         #endif
-        let task: Task<CatalogResponse, Error>
+        let task: Task<APIv2CatalogResult, Error>
         if let existing = browseFirstPageTasks[key] {
             task = existing
         } else {
@@ -589,11 +673,10 @@ enum StartupContentPrefetcher {
                     state,
                     libraryId: libraryId,
                     mediaType: .movie,
-                    offset: 0,
                     limit: browsePageSize,
                     includeType: false
                 )
-                return try await SiloAPI.shared.catalog(query: query)
+                return try await SiloAPI.shared.catalogPage(query: query)
             }
             browseFirstPageTasks[key] = task
         }
@@ -607,8 +690,8 @@ enum StartupContentPrefetcher {
             #if os(iOS) || os(tvOS)
             probe.finish(error: nil)
             #endif
-            ResponseCache.shared.set(response, for: key)
-            prefetchBrowseArtwork(for: response)
+            ResponseCache.shared.set(CatalogResponse(catalogPage: response.value), for: key)
+            prefetchBrowseArtwork(for: CatalogResponse(catalogPage: response.value))
             return response
         } catch {
             if profileScopedGeneration == generation {

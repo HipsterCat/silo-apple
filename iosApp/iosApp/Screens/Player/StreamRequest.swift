@@ -5,6 +5,7 @@ struct StreamRequest {
     let url: URL
     let headers: [String: String]
     let serverUrl: String
+    var proxyAuxiliaryScope: ProxyAuxiliaryScope? = nil
 
     /// Resolve the server's engine-neutral transport without allowing the
     /// user's API credential to cross an origin boundary. Header-authenticated
@@ -29,7 +30,8 @@ struct StreamRequest {
         additionalHeaders: [String: String],
         accessToken: String?,
         requiresHeaderAuthenticatedMedia: Bool,
-        authorizedMediaOriginSessionId: String? = nil
+        authorizedMediaOriginSessionId: String? = nil,
+        apiV2SessionId: String? = nil
     ) -> StreamRequest? {
         let raw = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return nil }
@@ -73,6 +75,14 @@ struct StreamRequest {
             }
             resolvedURL = proxyURL
             isAuthorizedMediaOrigin = true
+        } else if requiresHeaderAuthenticatedMedia, raw.hasPrefix("/api/v2/") {
+            guard let sessionId = apiV2SessionId,
+                  (Self.v2ExecutorReference(rawURL: raw, sessionID: sessionId) != nil
+                    || Self.isHeaderAuthenticatedAPIPrimary(raw, sessionID: sessionId)),
+                  let resolved = URL(string: normalizedServer + raw) else { return nil }
+            // Validate without rebuilding the server-issued path or query.
+            // The signed executor reference is opaque and bound to this session.
+            resolvedURL = resolved
         } else if requiresHeaderAuthenticatedMedia {
             guard !raw.contains("://"),
                   !raw.hasPrefix("//"),
@@ -115,6 +125,56 @@ struct StreamRequest {
             headers["Authorization"] = "Bearer \(accessToken)"
         }
         return StreamRequest(url: resolvedURL, headers: headers, serverUrl: normalizedServer)
+    }
+
+    static func isHeaderAuthenticatedAPIPrimary(_ raw: String, sessionID: String) -> Bool {
+        guard UUID(uuidString: sessionID) != nil, let url = URLComponents(string: raw),
+              url.scheme == nil, url.host == nil, url.fragment == nil,
+              ["/api/v2/stream/\(sessionID)", "/api/v2/playback/transcode/\(sessionID)/master.m3u8"].contains(url.percentEncodedPath) else { return false }
+        return hasAllowedAuthorizedMediaOriginQuery(url.queryItems ?? [])
+    }
+
+    /// The executor reference is opaque. Accept only a bound v2 media or subtitle path;
+    /// preserve the server-issued bytes rather than interpreting or signing the reference.
+    static func v2ExecutorReference(rawURL: String, sessionID: String) -> String? {
+        guard UUID(uuidString: sessionID) != nil,
+              let url = URLComponents(string: rawURL), url.scheme == nil, url.host == nil,
+              url.fragment == nil, let items = url.queryItems else { return nil }
+        let path = url.percentEncodedPath
+        let media = ["/api/v2/stream/\(sessionID)", "/api/v2/playback/transcode/\(sessionID)/master.m3u8"].contains(path)
+        let subtitlePrefix = "/api/v2/stream/\(sessionID)/subtitles/"
+        let subtitle: Bool
+        if path.hasPrefix(subtitlePrefix) {
+            let tail = String(path.dropFirst(subtitlePrefix.count))
+            let track = tail.hasSuffix("/fonts") ? String(tail.dropLast(6)) : tail
+            guard !track.isEmpty else { return nil }
+            let parts = track.split(separator: ".", omittingEmptySubsequences: false)
+            subtitle = (parts.count == 1 || (parts.count == 2 && ["vtt", "ass", "ssa", "srt", "sup"].contains(String(parts[1]))))
+                && Self.isNonNegativeInteger(String(parts[0]))
+        } else { subtitle = false }
+        guard media || subtitle else { return nil }
+        var names = Set<String>()
+        var reference: String?
+        var subtitleIdentity: String?
+        for item in items {
+            guard names.insert(item.name).inserted, let value = item.value, !value.isEmpty else { return nil }
+            switch item.name {
+            case "st": reference = value
+            case "file_id":
+                guard subtitle, Self.isNonNegativeInteger(value) else { return nil }
+            case "downloaded_subtitle_id", "embedded_stream_index":
+                guard subtitle, subtitleIdentity == nil, Self.isNonNegativeInteger(value) else { return nil }
+                subtitleIdentity = item.name
+            case "external_subtitle_key":
+                // The server issues a 64-character hexadecimal opaque identity.
+                // Validate its wire shape without interpreting or rebuilding it.
+                guard subtitle, subtitleIdentity == nil, value.utf8.count == 64,
+                      value.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else { return nil }
+                subtitleIdentity = item.name
+            default: return nil
+            }
+        }
+        return reference
     }
 
     /// The absolute form `authorized_media_origins_v1` permits. The server may
@@ -279,6 +339,65 @@ struct StreamRequest {
             && !segments[2].isEmpty
             && segments[3] == "subtitles"
             && !segments[4].isEmpty
+    }
+
+    /// Recognizes the new family for fail-closed dispatch. Validation below
+    /// still requires the exact issued session, origin, file and source pins.
+    static func isHeaderAuthenticatedAuxiliaryURL(_ raw: String) -> Bool {
+        guard let url = URLComponents(string: raw) else { return false }
+        if url.path.hasPrefix("/stream/v3/") && url.path.contains("/subtitles") { return true }
+        return url.path.hasPrefix("/api/v2/stream/") && url.path.contains("/subtitles")
+            && !(url.queryItems ?? []).contains { $0.name == "st" }
+
+    }
+
+    static func proxyAuxiliaryPins(rawURL: String, sessionID: String, origin: URL,
+                                   fileID: Int, track: Int) -> [String: String]? {
+        guard rawURL == rawURL.trimmingCharacters(in: .whitespacesAndNewlines),
+              UUID(uuidString: sessionID) != nil, fileID > 0, track >= 0,
+              let url = URL(string: rawURL, relativeTo: origin)?.absoluteURL,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: true),
+              ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+              hasSameOrigin(url, origin), components.user == nil, components.password == nil,
+              components.fragment == nil, !components.percentEncodedPath.contains("%"),
+              !components.percentEncodedPath.contains("\\") else { return nil }
+        let parts = components.percentEncodedPath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        let prefix: [String]
+        if parts.starts(with: ["", "stream", "v3"]) { prefix = ["", "stream", "v3", sessionID, "subtitles"] }
+        else { prefix = ["", "api", "v2", "stream", sessionID, "subtitles"] }
+        guard parts.starts(with: prefix), parts.count == prefix.count + 1 || parts.count == prefix.count + 2 else { return nil }
+        let fonts = parts.count == prefix.count + 2
+        guard !fonts || parts.last == "fonts" else { return nil }
+        let selection = parts[prefix.count].split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        guard selection.count == 2 || (fonts && selection.count == 1),
+              isNonNegativeInteger(selection[0]), Int(selection[0]) == track,
+              selection.count == 1 || ["ass", "ssa", "vtt", "srt", "sup"].contains(selection[1]) else { return nil }
+        var seen = Set<String>()
+        var pins: [String: String] = [:]
+        var sourcePin = false
+        for item in components.queryItems ?? [] {
+            guard seen.insert(item.name).inserted, let value = item.value, !value.isEmpty else { return nil }
+            switch item.name {
+            case "file_id":
+                guard value == String(fileID) else { return nil }
+                pins[item.name] = value
+            case "embedded_stream_index", "downloaded_subtitle_id":
+                guard !sourcePin, isNonNegativeInteger(value),
+                      item.name != "downloaded_subtitle_id" || Int(value)! > 0 else { return nil }
+                sourcePin = true; pins[item.name] = value
+            case "external_subtitle_key":
+                guard !sourcePin, value.utf8.count == 64,
+                      value.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else { return nil }
+                sourcePin = true; pins[item.name] = value
+            case "windowed":
+                guard !fonts, selection.last == "sup", ["0", "1", "false", "true"].contains(value) else { return nil }
+            case "position", "duration":
+                guard !fonts, selection.last == "sup", let number = Double(value), number.isFinite,
+                      number >= 0, item.name != "duration" || number > 0 else { return nil }
+            default: return nil
+            }
+        }
+        return pins["file_id"] != nil && sourcePin ? pins : nil
     }
 
     private static func isNonNegativeInteger(_ value: String) -> Bool {

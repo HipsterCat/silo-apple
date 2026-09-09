@@ -28,8 +28,10 @@ final class ImageSizeCapabilityTests: XCTestCase {
     /// The capability payload as the server documents it.
     private let capabilityJSON = """
     {
-      "schema_version": 1,
+      "revision": "1",
+      "state": "available",
       "param": "image_size",
+      "season_list_artwork_param": "include_artwork",
       "sizes": ["small", "medium", "large", "original"],
       "widths": {
         "poster": {"small": 300, "medium": 500, "large": 780},
@@ -52,8 +54,9 @@ final class ImageSizeCapabilityTests: XCTestCase {
 
     func testCapabilityDecodesServerPayload() throws {
         let capability = try decodedCapability()
-        XCTAssertEqual(capability.schemaVersion, 1)
+        XCTAssertEqual(capability.revision, "1")
         XCTAssertEqual(capability.param, "image_size")
+        XCTAssertEqual(capability.seasonListArtworkParam, "include_artwork")
         XCTAssertEqual(capability.sizes, ["small", "medium", "large", "original"])
         XCTAssertEqual(capability.originalMaxWidthPx, 1920)
         XCTAssertEqual(capability.widths["poster"]?["large"], 780)
@@ -66,7 +69,8 @@ final class ImageSizeCapabilityTests: XCTestCase {
     func testCapabilityDecodesUnknownImageRole() throws {
         let json = """
         {
-          "schema_version": 1,
+          "revision": "1",
+          "state": "available",
           "param": "image_size",
           "sizes": ["small", "large"],
           "widths": {"thumb": {"small": 120, "large": 480}},
@@ -109,10 +113,11 @@ final class ImageSizeCapabilityTests: XCTestCase {
         XCTAssertTrue(entries.isEmpty)
     }
 
-    /// A schema the client doesn't understand is treated as "off".
-    func testQueryEntriesEmptyForUnknownSchemaVersion() {
+    /// A revision the client doesn't understand is treated as "off".
+    func testQueryEntriesEmptyForUnknownRevision() {
         let capability = ImageSizeCapabilityResponse(
-            schemaVersion: 2,
+            revision: "2",
+            state: "available",
             param: "image_size",
             sizes: ["small", "large"],
             widths: [:],
@@ -130,7 +135,8 @@ final class ImageSizeCapabilityTests: XCTestCase {
     /// because an unadvertised value is a 400.
     func testQueryEntriesEmptyWhenLargeNotAdvertised() {
         let capability = ImageSizeCapabilityResponse(
-            schemaVersion: 1,
+            revision: "1",
+            state: "available",
             param: "image_size",
             sizes: ["small", "medium"],
             widths: [:],
@@ -147,7 +153,8 @@ final class ImageSizeCapabilityTests: XCTestCase {
     /// The parameter name comes from the payload, not a hardcoded string.
     func testQueryEntriesUseServerSuppliedParamName() {
         let capability = ImageSizeCapabilityResponse(
-            schemaVersion: 1,
+            revision: "1",
+            state: "available",
             param: "img_size",
             sizes: ["large"],
             widths: [:],
@@ -160,6 +167,14 @@ final class ImageSizeCapabilityTests: XCTestCase {
             ),
             ["img_size": "large"]
         )
+    }
+
+    func testUnavailableAndUnknownStatesDoNotAdvertiseLarge() throws {
+        for state in ["unavailable", "disabled", "future"] {
+            let json = capabilityJSON.replacingOccurrences(of: "available", with: state)
+            let capability = try decoder().decode(ImageSizeCapabilityResponse.self, from: Data(json.utf8))
+            XCTAssertTrue(ImageSizeSelection.queryEntries(capability: capability, prefersLargeImages: true).isEmpty)
+        }
     }
 
     // MARK: - Lifecycle

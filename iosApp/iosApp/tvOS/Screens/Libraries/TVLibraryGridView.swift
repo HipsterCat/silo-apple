@@ -101,12 +101,12 @@ struct TVLibraryGridView: View {
         .animation(.easeOut(duration: 0.18), value: openPanel)
         .siloBackground()
         .task {
-            if viewModel.items.isEmpty {
-                await viewModel.loadInitial()
-            }
+            await viewModel.loadInitial()
             await viewModel.loadFacetsIfNeeded()
         }
-        .onDisappear { viewModel.cancelPosterPrefetch() }
+        .onAppear { noteShellFocusRequest(focusRequest) }
+        .onDisappear { viewModel.cancel() }
+        .onChange(of: focusRequest) { _, request in noteShellFocusRequest(request) }
     }
 
     @ViewBuilder
@@ -162,6 +162,10 @@ struct TVLibraryGridView: View {
                 )
                 .padding(.horizontal, SiloTheme.safePadding)
 
+                if let error = viewModel.error, !viewModel.items.isEmpty {
+                    Text(error.message).foregroundColor(.siloError)
+                    Button("Reload results") { Task { await viewModel.loadInitial() } }
+                }
                 if viewModel.items.isEmpty && viewModel.isLoading {
                     Color.clear
                         .frame(maxWidth: .infinity, minHeight: 400)
@@ -185,6 +189,7 @@ struct TVLibraryGridView: View {
                         onNearEnd: { _ in
                             Task { await viewModel.loadMoreIfNeeded() }
                         },
+                        libraryCardContext: TVLibraryCardContext(libraryId: libraryId, model: viewModel),
                         focusRequest: gridFocusRequest,
                         onRowVisibilityChange: { range, isVisible in
                             viewModel.setPosterRowVisibility(range, isVisible: isVisible)

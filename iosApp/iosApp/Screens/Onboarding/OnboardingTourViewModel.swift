@@ -2,14 +2,14 @@ import Foundation
 
 #if !os(tvOS)
 protocol OnboardingTourAPI: Sendable {
+    func requireCurrentFlowOwner() async throws
+    func flowSettingsOwner() async throws -> CapturedDurableAccountAuth?
     func onboardingFlow(surface: String) async throws -> OnboardingFlow
     func postOnboardingProgress(_ request: OnboardingProgressRequest) async throws
     func updateProfile(profileId: String, body: UpdateProfileBody) async throws
     func setSetting(key: String, value: String) async throws
     func setDeviceSetting(key: String, value: String) async throws
 }
-
-extension SiloAPI: OnboardingTourAPI {}
 
 private enum OnboardingTourError: LocalizedError {
     case unsupportedSetting(String)
@@ -45,12 +45,14 @@ class OnboardingTourViewModel {
     var selectedValues: [String: String] = [:]
 
     private var tourId: String = ""
+    private var writerID: UUID?
+    private var needsReload = false
     private let api: any OnboardingTourAPI
     private let runtimeSettingsRefresher: any OnboardingRuntimeSettingsRefreshing
     private let activeProfileId: @MainActor () -> String?
 
     init(
-        api: any OnboardingTourAPI = SiloAPI.shared,
+        api: any OnboardingTourAPI = OnboardingSettingsV2Transport(),
         runtimeSettingsRefresher: (any OnboardingRuntimeSettingsRefreshing)? = nil,
         activeProfileId: @escaping @MainActor () -> String? = { AuthService.shared.profileId }
     ) {
@@ -61,15 +63,24 @@ class OnboardingTourViewModel {
     }
 
     func load(resumeStepId: String? = nil) async {
+        let serverId = ServerRegistry.shared.activeServerId
+        let profileId = activeProfileId()
+        isLoading = true
+        error = nil
+        defer { isLoading = false }
         do {
             let flow = try await api.onboardingFlow(surface: "phone")
+            try await api.requireCurrentFlowOwner()
+            guard activeProfileId() == profileId else { throw HTTPError.requestIdentityChanged }
+            writerID = flow.writerID
+            needsReload = false
+            currentIndex = 0
+            if flow.acknowledgedState?.done == true { finished = true; return }
             let renderable = flow.steps.filter { Self.knownKinds.contains($0.kind) }
             if renderable.isEmpty {
                 // Nothing we can show: dismiss now and persist a retry marker
                 // before posting completion so a transient failure cannot
                 // reopen an empty modal on every launch.
-                let serverId = ServerRegistry.shared.activeServerId
-                let profileId = AuthService.shared.profileId
                 if let serverId, let profileId {
                     UnrenderableOnboardingTourSuppression.set(
                         serverId: serverId,
@@ -78,7 +89,7 @@ class OnboardingTourViewModel {
                     )
                 }
                 do {
-                    try await api.postOnboardingProgress(OnboardingProgressRequest(
+                    try await saveProgress(OnboardingProgressRequest(
                         tourId: flow.tourId,
                         lastStep: nil,
                         completed: true,
@@ -92,26 +103,38 @@ class OnboardingTourViewModel {
                         )
                     }
                 } catch {
-                    // The durable marker makes the gate retry without showing
-                    // an empty tour, so dismissal is still safe here.
+                    // Retain local suppression. An uncertain completion is never replayed.
                 }
                 finished = true
                 return
             }
             tourId = flow.tourId
             steps = renderable
-            if let resumeStepId,
+            if let resumeStepId = flow.acknowledgedState?.lastStep ?? resumeStepId,
                let resumeIndex = renderable.firstIndex(where: { $0.id == resumeStepId }) {
                 currentIndex = resumeIndex
             }
-            isLoading = false
         } catch {
-            finished = true
+            self.error = error.localizedDescription
+            needsReload = true
+        }
+    }
+
+    private func saveProgress(_ request: OnboardingProgressRequest) async throws {
+        try await api.requireCurrentFlowOwner()
+        var captured = request
+        captured.writerID = writerID
+        do { try await api.postOnboardingProgress(captured) }
+        catch {
+            needsReload = true
+            writerID = nil
+            throw error
         }
     }
 
     func advance() async {
         guard !isSaving else { return }
+        if needsReload { await load(); return }
         isSaving = true
         error = nil
         defer { isSaving = false }
@@ -127,7 +150,7 @@ class OnboardingTourViewModel {
         guard next < steps.count else {
             let lastStep = steps.indices.contains(currentIndex) ? steps[currentIndex].id : nil
             do {
-                try await api.postOnboardingProgress(OnboardingProgressRequest(
+                try await saveProgress(OnboardingProgressRequest(
                     tourId: tourId,
                     lastStep: lastStep,
                     completed: true,
@@ -142,7 +165,7 @@ class OnboardingTourViewModel {
         }
         let stepId = steps[next].id
         do {
-            try await api.postOnboardingProgress(OnboardingProgressRequest(
+            try await saveProgress(OnboardingProgressRequest(
                 tourId: tourId,
                 lastStep: stepId,
                 completed: false,
@@ -170,6 +193,7 @@ class OnboardingTourViewModel {
         persistCurrentDefault: Bool = true
     ) async {
         guard !isSaving else { return }
+        if needsReload { await load(); return }
         isSaving = true
         error = nil
         defer { isSaving = false }
@@ -178,7 +202,7 @@ class OnboardingTourViewModel {
             if !skipped, persistCurrentDefault {
                 try await persistDefaultForCurrentStepIfNeeded()
             }
-            try await api.postOnboardingProgress(OnboardingProgressRequest(
+            try await saveProgress(OnboardingProgressRequest(
                 tourId: tourId,
                 lastStep: lastStep,
                 completed: !skipped,
@@ -203,12 +227,14 @@ class OnboardingTourViewModel {
     /// targets or keys remain visible as a recoverable error.
     func choose(step: OnboardingStep, value: String) async {
         guard !isSaving, let spec = step.setting else { return }
+        if needsReload { await load(); return }
         isSaving = true
         error = nil
         defer { isSaving = false }
 
         do {
             try await writeSetting(spec: spec, value: value)
+            try await api.requireCurrentFlowOwner()
             selectedValues[step.id] = value
         } catch {
             self.error = error.localizedDescription
@@ -233,13 +259,16 @@ class OnboardingTourViewModel {
               let spec = step.setting,
               let value = spec.default else { return }
         try await writeSetting(spec: spec, value: value)
+        try await api.requireCurrentFlowOwner()
         selectedValues[step.id] = value
     }
 
     private func writeSetting(spec: OnboardingSettingSpec, value: String) async throws {
+        let profileId = activeProfileId()
+        try await api.requireCurrentFlowOwner()
         switch spec.target {
         case "profile_field":
-            guard let profileId = activeProfileId() else {
+            guard let profileId else {
                 throw OnboardingTourError.missingProfile
             }
 
@@ -253,10 +282,14 @@ class OnboardingTourViewModel {
             default: throw OnboardingTourError.unsupportedSetting(spec.key)
             }
             try await api.updateProfile(profileId: profileId, body: body)
+            try await api.requireCurrentFlowOwner()
+            guard activeProfileId() == profileId else { throw HTTPError.requestIdentityChanged }
+            let owner = try await api.flowSettingsOwner()
+            try await api.requireCurrentFlowOwner()
             await runtimeSettingsRefresher.refreshAfterProfileWrite(
-                key: spec.key,
-                value: value
+                key: spec.key, value: value, owner: owner
             )
+            try await api.requireCurrentFlowOwner()
         case "setting":
             try await api.setSetting(key: spec.key, value: value)
         case "device_setting":

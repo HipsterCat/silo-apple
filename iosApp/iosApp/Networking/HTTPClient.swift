@@ -399,16 +399,22 @@ actor HTTPClient {
     /// caller can address a profile other than the session default. Everything
     /// else — server URL resolution, 401 refresh, non-2xx translation — is the
     /// path every other request takes.
+    /// `acceptedStatuses` only applies with `requestIdentity`; it exposes selected
+    /// non-2xx responses after normal scoped auth handling, without adding retries.
     func requestData(
         method: String,
         path: String,
         query: [String: String] = [:],
+        repeatedQuery: [URLQueryItem] = [],
         body: Data? = nil,
         contentType: String = "application/json",
         headers: [String: String] = [:],
         quietStatuses: Set<Int> = [],
         timeout: HTTPTimeout = .standard,
-        requestIdentity: HTTPRequestIdentity? = nil
+        requestIdentity: HTTPRequestIdentity? = nil,
+        acceptedStatuses: Set<Int> = [],
+        expectedAccount: RefreshAccountIdentity? = nil,
+        expectedAuth: CapturedOrdinaryRequestAuth? = nil
     ) async throws -> HTTPRawResponse {
         if let requestIdentity {
             let dispatchRevision = try captureRequestDispatchRevision()
@@ -416,10 +422,16 @@ actor HTTPClient {
                 await requestCaptureBarrier()
             }
             var auth = try await tokenStore.captureRequestAuth(expected: requestIdentity)
+            if let expectedAccount, auth.account != expectedAccount { throw HTTPError.requestIdentityChanged }
+            if let expectedAuth {
+                guard auth.account == expectedAuth.account, auth.profileId == expectedAuth.profileId,
+                      auth.profileToken == expectedAuth.profileToken else { throw HTTPError.requestIdentityChanged }
+            }
             var request = try scopedRequest(
                 method: method,
                 path: path,
                 query: query,
+                repeatedQuery: repeatedQuery,
                 body: body,
                 contentType: contentType,
                 headers: headers,
@@ -432,7 +444,7 @@ actor HTTPClient {
             )
 
             if response.statusCode == 401,
-               shouldAttemptRefresh(path: path),
+               shouldAttemptRefresh(path: path, method: method),
                await refreshScopedTokens(
                    auth: auth,
                    expected: requestIdentity,
@@ -449,6 +461,9 @@ actor HTTPClient {
                 if let refreshedAuth = try? await tokenStore.captureRequestAuth(
                     expected: requestIdentity
                 ),
+                   (expectedAuth == nil || (refreshedAuth.account == expectedAuth?.account
+                       && refreshedAuth.profileId == expectedAuth?.profileId
+                       && refreshedAuth.profileToken == expectedAuth?.profileToken)),
                    refreshedAuth.account == originalAuth.account,
                    refreshedAuth.credentialOwner == originalAuth.credentialOwner,
                    refreshedAuth.accessToken != nil,
@@ -459,6 +474,7 @@ actor HTTPClient {
                         method: method,
                         path: path,
                         query: query,
+                        repeatedQuery: repeatedQuery,
                         body: body,
                         contentType: contentType,
                         headers: headers,
@@ -489,7 +505,7 @@ actor HTTPClient {
                     )
                     #endif
                 }
-            } else if response.statusCode == 401, shouldAttemptRefresh(path: path) {
+            } else if response.statusCode == 401, shouldAttemptRefresh(path: path, method: method) {
                 // Refresh was eligible but declined (wrong credential owner,
                 // no refresh token, dispatch blocked). `shouldAttemptRefresh`
                 // is re-checked so a 401 from `/auth/login` — an ordinary wrong
@@ -502,7 +518,11 @@ actor HTTPClient {
                 )
                 #endif
             }
-            try ensureSuccess(data, response, method: method, quietStatuses: quietStatuses)
+            // Scoped adapters may inspect documented error headers (for example Retry-After).
+            // All other callers retain the standard non-2xx error translation.
+            if !acceptedStatuses.contains(response.statusCode) {
+                try ensureSuccess(data, response, method: method, quietStatuses: quietStatuses)
+            }
             return HTTPRawResponse(
                 data: data,
                 statusCode: response.statusCode,
@@ -515,7 +535,9 @@ actor HTTPClient {
             path: path,
             additionalHeaders: headers,
             quietStatuses: quietStatuses,
-            timeout: timeout
+            timeout: timeout,
+            expectedAccount: expectedAccount,
+            expectedAuth: expectedAuth
         ) { serverUrl in
             var request = try self.buildRequest(
                 serverUrl: serverUrl,
@@ -524,6 +546,7 @@ actor HTTPClient {
                 query: query,
                 body: Optional<String>.none
             )
+            try Self.appendQuery(repeatedQuery, to: &request)
             if let body {
                 request.httpBody = body
                 request.setValue(contentType, forHTTPHeaderField: "Content-Type")
@@ -537,6 +560,7 @@ actor HTTPClient {
         method: String,
         path: String,
         query: [String: String],
+        repeatedQuery: [URLQueryItem] = [],
         body: Data?,
         contentType: String,
         headers: [String: String],
@@ -553,9 +577,20 @@ actor HTTPClient {
             request.httpBody = body
             request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
+        try Self.appendQuery(repeatedQuery, to: &request)
         attachCapturedAuthHeaders(&request, auth: auth)
         Self.apply(headers, to: &request)
         return request
+    }
+
+    private static func appendQuery(_ items: [URLQueryItem], to request: inout URLRequest) throws {
+        guard !items.isEmpty else { return }
+        guard let url = request.url, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw HTTPError.requestIdentityChanged
+        }
+        components.queryItems = (components.queryItems ?? []) + items
+        guard let updated = components.url else { throw HTTPError.requestIdentityChanged }
+        request.url = updated
     }
 
     /// Cancel all in-flight tasks on the shared session and drop any
@@ -924,6 +959,7 @@ actor HTTPClient {
         quietStatuses: Set<Int> = [],
         timeout: HTTPTimeout,
         expectedAccount: RefreshAccountIdentity? = nil,
+        expectedAuth: CapturedOrdinaryRequestAuth? = nil,
         makeRequest: (String) throws -> URLRequest
     ) async throws -> (Data, HTTPURLResponse) {
         let dispatchRevision = try captureRequestDispatchRevision()
@@ -934,6 +970,11 @@ actor HTTPClient {
         if let expectedAccount,
            capturedAuth?.account != expectedAccount {
             throw HTTPError.requestIdentityChanged
+        }
+        if let expectedAuth {
+            guard let capturedAuth, capturedAuth.account == expectedAuth.account,
+                  capturedAuth.profileId == expectedAuth.profileId,
+                  capturedAuth.profileToken == expectedAuth.profileToken else { throw HTTPError.requestIdentityChanged }
         }
         let serverUrl = if let capturedAuth {
             capturedAuth.account.serverURL
@@ -958,12 +999,15 @@ actor HTTPClient {
             dispatchRevision: dispatchRevision
         )
 
-        if response.statusCode == 401, shouldAttemptRefresh(path: path) {
+        if response.statusCode == 401, shouldAttemptRefresh(path: path, method: method) {
             if let capturedAuth,
                let refreshedAuth = await refreshTokens(
                    expected: capturedAuth,
                    dispatchRevision: dispatchRevision
                ),
+               (expectedAuth == nil || (refreshedAuth.account == expectedAuth?.account
+                   && refreshedAuth.profileId == expectedAuth?.profileId
+                   && refreshedAuth.profileToken == expectedAuth?.profileToken)),
                refreshedAuth.accessToken != nil,
                await tokenStore.currentOrdinaryRequestAuth(
                    matchingIdentityOf: refreshedAuth
@@ -1124,7 +1168,7 @@ actor HTTPClient {
         let path = request.url?.path ?? ""
         // Skip auth injection for /auth/refresh (avoid recursion) and
         // /auth/login (a prior expired token can't authorize a fresh login).
-        if path.hasSuffix("/auth/refresh") || path.hasSuffix("/auth/login") {
+        if Self.isPublicAuthPath(path) {
             return
         }
 
@@ -1152,7 +1196,7 @@ actor HTTPClient {
         auth: CapturedOrdinaryRequestAuth
     ) {
         let path = request.url?.path ?? ""
-        if path.hasSuffix("/auth/refresh") || path.hasSuffix("/auth/login") {
+        if Self.isPublicAuthPath(path) {
             return
         }
 
@@ -1683,9 +1727,41 @@ actor HTTPClient {
     }
     #endif
 
-    private func shouldAttemptRefresh(path: String) -> Bool {
+    /// Collecting polls and other public auth mutations may consume one-use state.
+    /// A rejected/uncertain request is never replayed by the auth refresh machinery.
+    private static func isPublicAuthPath(_ path: String) -> Bool {
+        path.hasSuffix("/auth/refresh") || path.hasSuffix("/auth/login") || [
+            "/api/v2/auth/device/start", "/api/v2/auth/device/poll", "/api/v2/auth/oauth/complete",
+            "/api/v2/system/setup", "/api/v2/auth/signup"
+        ].contains(path)
+    }
+
+    private func shouldAttemptRefresh(path: String, method: String) -> Bool {
         // Matches the guard in AuthInterceptorImpl.kt:96.
-        !path.hasSuffix("/auth/refresh") && !path.hasSuffix("/auth/login")
+        let diagnosticsUploads = "/api/v2/diagnostics/reports/uploads"
+        return !Self.isPublicAuthPath(path) && path != "/api/v2/diagnostics/reports"
+            && !(["PUT", "DELETE"].contains(method) && path.hasPrefix("/api/v2/settings/values/"))
+            && !(method == "POST" && path.hasPrefix("/api/v2/playback/sessions/") && path.hasSuffix("/control/ws-ticket"))
+            && !(method == "POST" && path.hasPrefix("/api/v2/playback/") && (path.hasSuffix("/replan") || path.hasSuffix("/route-events")))
+            && path != "/api/v2/subtitles/download"
+            && !(method == "POST" && path == "/api/v2/devices/push/apple")
+            && !(["PUT", "DELETE"].contains(method) && path.hasPrefix("/api/v2/watchlist/"))
+            && !(["PUT", "DELETE"].contains(method) && path.hasPrefix("/api/v2/favorites/"))
+            && !(["POST", "DELETE"].contains(method) && path.hasPrefix("/api/v2/watched/"))
+            && path != "/api/v2/downloads/subscriptions"
+            && path != "/api/v2/onboarding/progress"
+            && path != "/api/v2/subtitles/ai/translate"
+            && !(path.hasPrefix("/api/v2/catalog/items/") && path.hasSuffix("/translate-description"))
+            && !(method == "POST" && path.hasPrefix("/api/v2/catalog/items/") && path.hasSuffix("/trailers/refresh"))
+            && !(method == "POST" && path.hasPrefix("/api/v2/catalog/people/") && path.hasSuffix("/refresh"))
+            && !(path == "/api/v2/profiles" && method == "POST")
+            // A journaled own-profile PATCH has one dispatch, even when a
+            // refresh could obtain another bearer for the same account.
+            && !(method == "PATCH" && path.hasPrefix("/api/v2/profiles/")
+                && path.split(separator: "/").count == 4)
+            && !(path == "/api/v2/downloads" && method == "POST")
+            && path != diagnosticsUploads
+            && !(path.hasPrefix(diagnosticsUploads + "/") && path.hasSuffix("/complete"))
     }
 
     private var isRequestDispatchBlocked: Bool {
@@ -1721,7 +1797,7 @@ actor HTTPClient {
               auth.account.serverId == expected.serverId,
               auth.account.serverURL == ServerRegistry.normalize(url: expected.serverURL),
               let refreshValue = auth.refreshToken, !refreshValue.isEmpty,
-              URL(string: auth.serverURL + "/api/v1/auth/refresh") != nil else {
+              URL(string: auth.serverURL + "/api/v2/auth/refresh") != nil else {
             return false
         }
         if await scopedCredentialsChanged(since: auth, expected: expected) {
@@ -1775,7 +1851,7 @@ actor HTTPClient {
         encoder: JSONEncoder
     ) async -> Bool {
         guard let refreshValue = auth.refreshToken,
-              let url = URL(string: auth.serverURL + "/api/v1/auth/refresh") else {
+              let url = URL(string: auth.serverURL + "/api/v2/auth/refresh") else {
             return false
         }
         let captured = CapturedRefreshCredential(
@@ -1934,7 +2010,7 @@ actor HTTPClient {
             return false
         }
 
-        guard let url = URL(string: expected.serverURL + "/api/v1/auth/refresh") else {
+        guard let url = URL(string: expected.serverURL + "/api/v2/auth/refresh") else {
             Self.logger.error("Refresh skipped: invalid server URL")
             return false
         }
