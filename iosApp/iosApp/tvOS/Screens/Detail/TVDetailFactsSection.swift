@@ -61,4 +61,39 @@ struct TVDetailFactsSection: View {
         }
     }
 }
+
+// IGNORE: I guess we still need content richer variants as well to see it all . OK NEVERMIND its one column boring table, ignore here
+
+#if DEBUG
+private enum TVDetailPreviewItem {
+    static let movie: ItemDetail = {
+        let data = Data(#"""
+        {
+          "contentId": "preview-movie",
+          "type": "movie",
+          "title": "Cinema Paradiso",
+          "year": 1988,
+          "runtime": 124,
+          "contentRating": "PG",
+          "genres": ["Drama", "Romance"],
+          "crew": [
+            { "name": "Giuseppe Tornatore", "job": "Director" },
+            { "name": "Giuseppe Tornatore", "job": "Writer" }
+          ],
+          "studios": ["Cristaldifilm"],
+          "countries": ["Italy"],
+          "releaseDate": "1988-11-17"
+        }
+        """#.utf8)
+        return try! JSONDecoder().decode(ItemDetail.self, from: data)
+    }()
+}
+
+#Preview("Facts") {
+    TVDetailFactsSection(detail: TVDetailPreviewItem.movie)
+        .padding(80)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+}
+#endif
 #endif

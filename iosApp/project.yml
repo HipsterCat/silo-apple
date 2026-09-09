@@ -502,6 +502,10 @@ schemes:
         SiloMac: all
     run:
       config: Debug
+      # Offline detail template — no auth / API. Flip off in the scheme editor
+      # when you want the normal Mac app again.
+      commandLineArguments:
+        "-debugDetailPreview": true
     test:
       config: Debug
     archive:

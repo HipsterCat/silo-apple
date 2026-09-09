@@ -887,4 +887,64 @@ private struct TVPlaybackSelectionSummaryView: View {
         .accessibilityLabel("\(label.capitalized), \(value ?? "loading")")
     }
 }
+// STEAL: Not too bad hero layout, but some changes still needed
+#if DEBUG
+#Preview("Logo fallback") {
+    TVDecodedLogoTitle(
+        logoUrl: nil,
+        accessibilityLabel: "Cinema Paradiso",
+        maxWidth: 620,
+        maxHeight: 138
+    ) {
+        Text("CINEMA PARADISO")
+            .font(.system(size: 72, weight: .black))
+            .foregroundStyle(.white)
+    }
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Hero") {
+    TVDetailHero(
+        title: "Cinema Paradiso",
+        seriesTitle: nil,
+        logoUrl: nil,
+        backdropUrl: nil,
+        backdropThumbhash: nil,
+        eyebrow: nil,
+        sourceTokens: ["Drama, Romance"],
+        ratingChip: "PG",
+        overview: "A filmmaker recalls his childhood, when he fell in love with the movies at his village's theater and formed a deep friendship with the theater's projectionist.",
+        factsLine: [
+            .text("1988"),
+            .text("2h 4m"),
+            .chip("4K"),
+            .chip("HDR")
+        ],
+        starringText: "Starring Philippe Noiret, Jacques Perrin, Salvatore Cascio",
+        playbackSummary: TVPlaybackSelectionSummary(
+            version: "1080p",
+            audio: "English",
+            subtitles: "Off"
+        ),
+        actions: { EmptyView() },
+        belowSynopsis: { EmptyView() }
+    )
+    .background(.black)
+}
+
+#Preview("Playback summary") {
+    TVPlaybackSelectionSummaryView(
+        summary: TVPlaybackSelectionSummary(
+            version: "Auto · 1080p",
+            audio: "English 5.1",
+            subtitles: "Off"
+        )
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

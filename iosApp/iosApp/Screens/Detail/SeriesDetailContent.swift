@@ -535,4 +535,38 @@ struct SeriesDetailContent<BelowOverview: View>: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Series detail") {
+    let seasons = ItemDetailPreviewData.seasons
+    SeriesDetailContent(
+        detail: ItemDetailPreviewData.series,
+        isFavorite: false,
+        inWatchlist: true,
+        isWatched: false,
+        seasons: seasons,
+        selectedSeason: seasons.first,
+        episodes: ItemDetailPreviewData.episodes,
+        isLoadingEpisodes: false,
+        selectedNextUpFileId: nil,
+        selectedNextUpAudioTrackIndex: nil,
+        selectedNextUpSubtitleTrackIndex: nil,
+        nextUpWatchDetail: nil,
+        onSelectSeason: { _ in },
+        onPlayEpisode: { _, _, _ in },
+        onEpisodeTap: { _ in },
+        onSelectNextUpVersion: { _ in },
+        onSelectNextUpAudioTrack: { _ in },
+        onSelectNextUpSubtitleTrack: { _ in },
+        onToggleFavorite: {},
+        onToggleWatchlist: {},
+        onToggleWatched: {},
+        onPersonTap: { _ in },
+        onNavigateToItem: { _ in },
+        belowOverview: { EmptyView() }
+    )
+    .environmentObject(OverlayPrefsStore.shared)
+    .preferredColorScheme(.dark)
+}
+#endif
 #endif

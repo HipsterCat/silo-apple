@@ -480,4 +480,36 @@ struct MovieDetailContent<BelowOverview: View>: View {
         )
     }
 }
+
+#if DEBUG
+#Preview("Movie detail") {
+    MovieDetailContent(
+        detail: ItemDetailPreviewData.movie,
+        isFavorite: true,
+        inWatchlist: false,
+        isWatched: false,
+        selectedVersionFileId: 101,
+        selectedAudioTrackIndex: nil,
+        selectedSubtitleTrackIndex: nil,
+        seasons: [],
+        selectedSeason: nil,
+        seasonEpisodes: [],
+        isLoadingEpisodes: false,
+        onPlay: { _ in },
+        onSelectVersion: { _ in },
+        onSelectAudioTrack: { _ in },
+        onSelectSubtitleTrack: { _ in },
+        onSelectSeason: { _ in },
+        onToggleFavorite: {},
+        onToggleWatchlist: {},
+        onToggleWatched: {},
+        onPersonTap: { _ in },
+        onNavigateToItem: { _ in },
+        onEpisodeTap: { _ in },
+        belowOverview: { EmptyView() }
+    )
+    .environmentObject(OverlayPrefsStore.shared)
+    .preferredColorScheme(.dark)
+}
+#endif
 #endif

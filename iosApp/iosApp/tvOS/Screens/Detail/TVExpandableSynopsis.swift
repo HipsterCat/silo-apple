@@ -56,4 +56,17 @@ private struct TVSynopsisButtonStyleBody: View {
             .animation(.easeOut(duration: SiloTheme.fastDuration), value: isFocused)
     }
 }
+
+// NEEDS: I guess we need it in focused state as well, in shorten, long, etc. But its nice to STEAL
+
+#if DEBUG
+#Preview("Synopsis") {
+    TVExpandableSynopsis(
+        overview: "A filmmaker recalls his childhood, when he fell in love with the movies at his village's theater and formed a deep friendship with the theater's projectionist."
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

@@ -811,4 +811,113 @@ private struct TVPillButtonBody: View {
 
 }
 
+// STEAL: maybe... at least double lined button primary is great extension
+
+#if DEBUG
+#Preview("Primary pill") {
+    TVPrimaryPillButton(
+        icon: "play.fill",
+        title: "Play",
+        subtitle: "2h 4m",
+        stabilizesFocusMotion: true,
+        action: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Secondary pill") {
+    TVSecondaryPillButton(
+        icon: "film",
+        title: "Trailer",
+        collapsesWhenUnfocused: false,
+        stabilizesFocusMotion: true,
+        action: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Circle actions") {
+    HStack(spacing: 18) {
+        TVCircleActionButton(
+            icon: "backward.end.fill",
+            title: "Start Over",
+            accessibilityLabel: "Start Over",
+            stabilizesFocusMotion: true,
+            action: {}
+        )
+        TVCircleActionButton(
+            icon: "bookmark",
+            iconActive: "bookmark.fill",
+            isActive: false,
+            title: "Watchlist",
+            accessibilityLabel: "Watchlist",
+            stabilizesFocusMotion: true,
+            action: {}
+        )
+        TVCircleMenuButton(
+            icon: "ellipsis",
+            title: "More",
+            accessibilityLabel: "More",
+            stabilizesFocusMotion: true,
+            items: {
+                [
+                    TVActionPopoverItem(id: "watched", title: "Mark as Watched"),
+                    TVActionPopoverItem(id: "share", title: "Share")
+                ]
+            },
+            onSelect: { _ in }
+        )
+    }
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Action row") {
+    TVDetailActionRowPreviewHost()
+}
+
+private struct TVDetailActionRowPreviewHost: View {
+    @Namespace private var focusNamespace
+    @FocusState private var playFocused: Bool
+    @FocusState private var rowFocused: Bool
+
+    var body: some View {
+        TVDetailActionRow(
+            playTitle: "Play",
+            playSubtitle: "2h 4m",
+            onPlay: {},
+            onStartOver: {},
+            inWatchlist: false,
+            onToggleWatchlist: {},
+            focusResetKey: "preview",
+            initialFocusScope: .page,
+            focusNamespace: focusNamespace,
+            playFocused: $playFocused,
+            rowFocused: $rowFocused,
+            stabilizesFocusMotion: true,
+            allowsInitialPlayFocus: false,
+            playbackSelectors: { EmptyView() },
+            moreMenu: {
+                TVCircleMenuButton(
+                    icon: "ellipsis",
+                    title: "More",
+                    accessibilityLabel: "More",
+                    stabilizesFocusMotion: true,
+                    items: { [TVActionPopoverItem(id: "watched", title: "Mark as Watched")] },
+                    onSelect: { _ in }
+                )
+            }
+        )
+        .padding(80)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+    }
+}
+#endif
+
 #endif

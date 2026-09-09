@@ -24,4 +24,16 @@ struct TVSectionHeader: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Section header") {
+    VStack(alignment: .leading, spacing: 40) {
+        TVSectionHeader(title: "Cast")
+        TVSectionHeader(label: "This Season", title: "Episodes")
+    }
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

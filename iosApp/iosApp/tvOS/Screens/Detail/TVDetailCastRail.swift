@@ -63,6 +63,53 @@ private extension View {
         }
     }
 }
+// IGNORE: it looks off, maybe it changes when filled cast, to check later
+#if DEBUG
+#Preview("Cast rail") {
+    TVDetailCastRail(
+        cast: [
+            CastMember(
+                name: "Philippe Noiret",
+                character: "Alfredo",
+                order: 0,
+                personId: "1",
+                tmdbId: nil,
+                tvdbId: nil,
+                imdbId: nil,
+                photoUrl: nil,
+                photoThumbhash: nil
+            ),
+            CastMember(
+                name: "Jacques Perrin",
+                character: "Salvatore (adult)",
+                order: 1,
+                personId: "2",
+                tmdbId: nil,
+                tvdbId: nil,
+                imdbId: nil,
+                photoUrl: nil,
+                photoThumbhash: nil
+            ),
+            CastMember(
+                name: "Salvatore Cascio",
+                character: "Salvatore (child)",
+                order: 2,
+                personId: "3",
+                tmdbId: nil,
+                tvdbId: nil,
+                imdbId: nil,
+                photoUrl: nil,
+                photoThumbhash: nil
+            )
+        ],
+        onTap: { _ in }
+    )
+    .frame(height: 360)
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 
 private struct TVCastCard: View {
     let member: CastMember
