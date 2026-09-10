@@ -381,4 +381,21 @@ private struct TVPosterRingButtonBody: View {
         return configuration.isPressed ? base * 0.97 : base
     }
 }
+
+#if DEBUG
+#Preview("Media card") {
+    let movie = ItemDetailPreviewData.movie
+    return TVMediaCard(
+        title: movie.title,
+        posterUrl: movie.posterUrl ?? "",
+        posterThumbhash: movie.posterThumbhash,
+        year: movie.year,
+        action: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+    .environmentObject(OverlayPrefsStore.shared)
+}
+#endif
 #endif

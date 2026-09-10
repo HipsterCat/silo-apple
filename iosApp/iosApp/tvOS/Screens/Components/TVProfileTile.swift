@@ -21,4 +21,23 @@ struct TVProfileTile: View {
         .focusEffectDisabled()
     }
 }
+
+#if DEBUG
+#Preview("Profile tile") {
+    TVProfileTile(
+        profile: UserProfile(
+            id: "preview-profile",
+            name: "Sasha",
+            avatarEmoji: "🎬",
+            hasPin: false,
+            isChild: false,
+            isPrimary: true
+        ),
+        action: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

@@ -612,4 +612,21 @@ private struct TVBrowsePanelRowBody: View {
             .animation(.easeOut(duration: 0.12), value: isFocused)
     }
 }
+
+// just for comparison, we need this control to TTAKE
+
+#if DEBUG
+#Preview("Browse controls") {
+    TVBrowseControlRow(
+        sortLabel: "Title",
+        sortDirection: "A–Z",
+        filterCount: 2,
+        onSort: {},
+        onFilter: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

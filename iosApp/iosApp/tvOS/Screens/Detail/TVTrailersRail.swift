@@ -330,4 +330,16 @@ enum TVTrailerLaunch {
         UIApplication.shared.open(url, options: [:], completionHandler: completion)
     }
 }
+
+#if DEBUG
+#Preview("Trailers rail") {
+    TVTrailersRail(
+        entries: TVDetailPreviewData.trailerEntries,
+        onSelect: { _ in }
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

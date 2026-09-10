@@ -221,4 +221,29 @@ struct SimilarPosterItem: Identifiable, Hashable {
         self.year = detail.year
     }
 }
+
+#if DEBUG
+#Preview("Similar strip") {
+    ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 44) {
+            ForEach(TVDetailPreviewData.similarItems) { item in
+                TVMediaCard(
+                    title: item.title,
+                    posterUrl: item.posterUrl ?? "",
+                    posterThumbhash: item.posterThumbhash,
+                    year: item.year,
+                    action: {},
+                    cardWidth: 220,
+                    focusTreatment: .ring
+                )
+            }
+        }
+        .padding(.vertical, 12)
+    }
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+    .environmentObject(OverlayPrefsStore.shared)
+}
+#endif
 #endif

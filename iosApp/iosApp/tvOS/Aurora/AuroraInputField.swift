@@ -87,4 +87,21 @@ struct AuroraInputField<F: Hashable>: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Input field") {
+    @Previewable @State var text = "https://silo.example"
+    @Previewable @FocusState var focused: String?
+    AuroraInputField(
+        text: $text,
+        placeholder: "Server address",
+        focus: $focused,
+        equals: "server"
+    )
+    .padding(80)
+    .frame(maxWidth: 720)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

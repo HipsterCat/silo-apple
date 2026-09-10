@@ -190,4 +190,16 @@ struct TVRootHeroBackdrop: View {
         .ignoresSafeArea()
     }
 }
+
+// STEAL to compare style, it doesnt render here
+
+#if DEBUG
+#Preview("Hero backdrop") {
+    TVRootHeroBackdrop(
+        tintColor: .siloBackground,
+        artworkURL: nil,
+        artworkThumbhash: nil
+    )
+}
+#endif
 #endif

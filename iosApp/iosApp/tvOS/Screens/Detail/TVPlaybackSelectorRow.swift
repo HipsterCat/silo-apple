@@ -282,4 +282,23 @@ struct TVPlaybackSelectionSummary: Equatable {
         return "Auto · \(resolved == "Off" ? "None" : resolved)"
     }
 }
+
+#if DEBUG
+#Preview("Playback selectors") {
+    let versions = ItemDetailPreviewData.movie.versions ?? []
+    return TVPlaybackActionSelectors(
+        versions: versions,
+        currentVersion: versions.first,
+        selectedVersionFileId: versions.first?.fileId,
+        selectedAudioTrackIndex: 0,
+        selectedSubtitleTrackIndex: nil,
+        onSelectVersion: { _ in },
+        onSelectAudioTrack: { _ in },
+        onSelectSubtitleTrack: { _ in }
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

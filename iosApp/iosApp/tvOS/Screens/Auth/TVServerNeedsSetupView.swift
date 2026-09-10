@@ -137,4 +137,10 @@ struct TVServerNeedsSetupView: View {
         isChecking = false
     }
 }
+
+#if DEBUG
+#Preview("Server needs setup") {
+    TVServerNeedsSetupView(router: AppRouter())
+}
+#endif
 #endif

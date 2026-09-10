@@ -481,6 +481,9 @@ struct MovieDetailContent<BelowOverview: View>: View {
     }
 }
 
+// STEALS just to compare details
+
+
 #if DEBUG
 #Preview("Movie detail") {
     MovieDetailContent(

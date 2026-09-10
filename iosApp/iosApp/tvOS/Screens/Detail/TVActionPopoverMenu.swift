@@ -386,4 +386,18 @@ private final class TVActionPopoverMenuPressUIView: UIView, UIGestureRecognizerD
         window != nil
     }
 }
+
+#if DEBUG
+#Preview("Version") {
+    TVActionPopoverMenu(
+        title: "Version",
+        items: TVDetailPreviewData.popoverItems,
+        onSelect: { _ in },
+        onClose: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

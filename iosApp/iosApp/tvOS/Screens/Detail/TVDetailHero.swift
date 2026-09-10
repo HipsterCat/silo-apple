@@ -892,11 +892,11 @@ private struct TVPlaybackSelectionSummaryView: View {
 #Preview("Logo fallback") {
     TVDecodedLogoTitle(
         logoUrl: nil,
-        accessibilityLabel: "Cinema Paradiso",
+        accessibilityLabel: ItemDetailPreviewData.movie.title,
         maxWidth: 620,
         maxHeight: 138
     ) {
-        Text("CINEMA PARADISO")
+        Text(ItemDetailPreviewData.movie.title.uppercased())
             .font(.system(size: 72, weight: .black))
             .foregroundStyle(.white)
     }
@@ -905,27 +905,63 @@ private struct TVPlaybackSelectionSummaryView: View {
     .background(.black)
 }
 
+// STEAL to compare details
+
+
 #Preview("Hero") {
-    TVDetailHero(
-        title: "Cinema Paradiso",
+    let movie = ItemDetailPreviewData.movie
+    return TVDetailHero(
+        title: movie.title,
         seriesTitle: nil,
-        logoUrl: nil,
-        backdropUrl: nil,
-        backdropThumbhash: nil,
-        eyebrow: nil,
-        sourceTokens: ["Drama, Romance"],
-        ratingChip: "PG",
-        overview: "A filmmaker recalls his childhood, when he fell in love with the movies at his village's theater and formed a deep friendship with the theater's projectionist.",
+        logoUrl: movie.logoUrl,
+        backdropUrl: movie.backdropUrl,
+        backdropThumbhash: movie.backdropThumbhash,
+        eyebrow: movie.tagline,
+        sourceTokens: movie.genres ?? [],
+        ratingChip: movie.contentRating,
+        overview: movie.overview,
         factsLine: [
-            .text("1988"),
-            .text("2h 4m"),
+            .text(movie.year.map(String.init) ?? ""),
+            .text("1h 56m"),
             .chip("4K"),
             .chip("HDR")
         ],
-        starringText: "Starring Philippe Noiret, Jacques Perrin, Salvatore Cascio",
+        starringText: "Starring Amy Adams, Jeremy Renner, Forest Whitaker",
         playbackSummary: TVPlaybackSelectionSummary(
-            version: "1080p",
-            audio: "English",
+            version: "2160p HEVC",
+            audio: "English Atmos",
+            subtitles: "Off"
+        ),
+        actions: { EmptyView() },
+        belowSynopsis: { EmptyView() }
+    )
+    .background(.black)
+}
+
+// STEAL to compare details
+
+#Preview("Hero · series") {
+    let series = ItemDetailPreviewData.series
+    return TVDetailHero(
+        title: series.title,
+        seriesTitle: series.title,
+        logoUrl: series.logoUrl,
+        backdropUrl: series.backdropUrl,
+        backdropThumbhash: series.backdropThumbhash,
+        eyebrow: series.tagline,
+        sourceTokens: series.genres ?? [],
+        ratingChip: series.contentRating,
+        overview: series.overview,
+        factsLine: [
+            .text(series.year.map(String.init) ?? ""),
+            .text("2 seasons"),
+            .chip("4K"),
+            .chip("HDR")
+        ],
+        starringText: "Starring Adam Scott, Britt Lower, Zach Cherry",
+        playbackSummary: TVPlaybackSelectionSummary(
+            version: "S1, E2 · 1080p",
+            audio: "English Atmos",
             subtitles: "Off"
         ),
         actions: { EmptyView() },

@@ -1064,4 +1064,37 @@ struct TVEpisodeRailPlaceholder: View {
     }
 }
 
+// STEAL to compare details
+
+#if DEBUG
+#Preview("Episode rail") {
+    TVEpisodeRail(
+        episodes: ItemDetailPreviewData.episodes,
+        onSelect: { _ in },
+        onPlay: { _ in },
+        currentContentId: ItemDetailPreviewData.episodes[1].contentId
+    )
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Episode card") {
+    TVEpisodeCard(
+        episode: ItemDetailPreviewData.episodes[1],
+        isCurrent: true,
+        onSelect: {},
+        onPlay: { _ in }
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Episode rail placeholder") {
+    TVEpisodeRailPlaceholder()
+        .padding(80)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+}
+#endif
 #endif

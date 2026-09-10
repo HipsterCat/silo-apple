@@ -177,4 +177,21 @@ private extension View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Collection card") {
+    TVCollectionPosterCard(
+        collection: LibraryCollection(
+            id: "preview-collection",
+            name: "Favorites",
+            collectionType: "movie",
+            itemCount: 12
+        ),
+        action: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

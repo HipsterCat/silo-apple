@@ -156,3 +156,13 @@ enum ImagePlaceholderStyle {
         }
     }
 }
+
+#if os(tvOS) && DEBUG
+#Preview("Placeholder") {
+    CachedAsyncImage(url: "", targetSize: CGSize(width: 220, height: 330))
+        .frame(width: 220, height: 330)
+        .padding(80)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+}
+#endif

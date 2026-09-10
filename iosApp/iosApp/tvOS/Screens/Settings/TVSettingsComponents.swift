@@ -919,4 +919,30 @@ struct TVSettingsSubtitlePreview: View {
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
+
+#if DEBUG
+#Preview("Picker row") {
+    TVSettingsPickerRow(title: "Quality", value: "Auto", action: {})
+        .padding(80)
+        .frame(maxWidth: 900)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+}
+
+#Preview("Toggle row") {
+    TVSettingsToggleRow(title: "Skip intros", isOn: true, action: {})
+        .padding(80)
+        .frame(maxWidth: 900)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+}
+
+#Preview("Info row") {
+    TVSettingsInfoRow(title: "Server", value: "silo.example")
+        .padding(80)
+        .frame(maxWidth: 900)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .background(.black)
+}
+#endif
 #endif

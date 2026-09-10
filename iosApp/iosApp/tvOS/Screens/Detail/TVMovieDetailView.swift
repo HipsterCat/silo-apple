@@ -448,4 +448,48 @@ struct TVMovieDetailView<BelowSynopsis: View>: View {
         )
     }
 }
+// STEALS just to compare details
+#if DEBUG
+#Preview("Movie detail") {
+    let movie = ItemDetailPreviewData.movie
+    return TVMovieDetailView(
+        detail: movie,
+        supportingDetail: nil,
+        isFavorite: true,
+        inWatchlist: false,
+        isWatched: false,
+        selectedVersionFileId: movie.versions?.first?.fileId,
+        selectedAudioTrackIndex: 0,
+        selectedSubtitleTrackIndex: nil,
+        seasons: [],
+        selectedSeason: nil,
+        seasonEpisodes: [],
+        episodeFavoriteStates: [:],
+        isLoadingEpisodes: false,
+        trailerEntries: TVDetailPreviewData.trailerEntries,
+        onSelectTrailer: { _ in },
+        supportsTrailerFetch: true,
+        onFindTrailers: {},
+        trailerFetchStatus: nil,
+        isFetchingTrailers: false,
+        onTrailerStatusShown: {},
+        onPlay: { _ in },
+        onSelectVersion: { _ in },
+        onSelectAudioTrack: { _ in },
+        onSelectSubtitleTrack: { _ in },
+        onSelectSeason: { _ in },
+        onToggleFavorite: {},
+        onToggleWatchlist: {},
+        onToggleWatched: {},
+        onPersonTap: { _ in },
+        onNavigateToItem: { _ in },
+        onEpisodeTap: { _ in },
+        onPlayEpisodeShortcut: { _ in },
+        onSetEpisodeWatched: { _, _ in true },
+        onSetEpisodeFavorite: { _, _ in true },
+        belowSynopsis: { EmptyView() }
+    )
+    .environmentObject(OverlayPrefsStore.shared)
+}
+#endif
 #endif

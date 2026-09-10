@@ -1,6 +1,8 @@
-#if DEBUG && !os(tvOS)
+#if DEBUG
 import Foundation
+#if canImport(SwiftUI)
 import SwiftUI
+#endif
 
 /// Static catalog payloads for offline detail UI work. Decoded with the shared
 /// API decoder so neither Xcode Previews nor `-debugDetailPreview` need a server.
@@ -209,6 +211,7 @@ enum ItemDetailPreviewData {
     }
 }
 
+#if !os(tvOS)
 /// Full-window host for `-debugDetailPreview`. No auth, no API.
 struct DetailPreviewRoot: View {
     enum Kind: String, CaseIterable, Identifiable {
@@ -327,4 +330,5 @@ struct DetailPreviewRoot: View {
         return .movie
     }
 }
+#endif
 #endif

@@ -98,4 +98,16 @@ struct HoldSeekIndicator: View {
         rate >= 0 ? "forward.fill" : "backward.fill"
     }
 }
+
+#if DEBUG
+#Preview("Hold seek") {
+    HoldSeekIndicator(
+        rate: 8,
+        previewTime: 2400,
+        duration: 6960,
+        previewImage: nil
+    )
+    .background(.black)
+}
+#endif
 #endif

@@ -140,4 +140,30 @@ private extension View {
         }
     }
 }
+
+// STEAL just to compare, naybe something ok
+
+#if DEBUG
+#Preview("Season chip") {
+    TVSeasonChip(
+        season: ItemDetailPreviewData.seasons[0],
+        isSelected: true,
+        onSelect: {}
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+
+#Preview("Season chip row") {
+    TVSeasonChipRow(
+        seasons: ItemDetailPreviewData.seasons,
+        selectedSeasonId: ItemDetailPreviewData.seasons[0].id,
+        onSelect: { _ in }
+    )
+    .padding(80)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    .background(.black)
+}
+#endif
 #endif

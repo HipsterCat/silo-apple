@@ -62,7 +62,7 @@ private struct TVSynopsisButtonStyleBody: View {
 #if DEBUG
 #Preview("Synopsis") {
     TVExpandableSynopsis(
-        overview: "A filmmaker recalls his childhood, when he fell in love with the movies at his village's theater and formed a deep friendship with the theater's projectionist."
+        overview: ItemDetailPreviewData.movie.overview ?? ""
     )
     .padding(80)
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)

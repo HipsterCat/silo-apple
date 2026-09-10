@@ -413,4 +413,10 @@ struct TVItemDetailLoadingView: View {
             .frame(width: width, height: height)
     }
 }
+
+#if DEBUG
+#Preview("Loading") {
+    TVItemDetailLoadingView(seed: nil)
+}
+#endif
 #endif

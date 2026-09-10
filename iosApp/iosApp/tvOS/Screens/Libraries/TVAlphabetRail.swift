@@ -160,4 +160,16 @@ private struct LetterButtonBody: View {
         return .clear
     }
 }
+
+#if DEBUG
+#Preview("Alphabet rail") {
+    @Previewable @State var selected: String? = "A"
+    HStack {
+        Spacer()
+        TVAlphabetRail(selected: $selected, onSelect: { _ in })
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
 #endif
