@@ -13,8 +13,7 @@ final class AuthService: @unchecked Sendable {
     private let serverIdentityResolver: ServerIdentityResolver
     private let serverRegistry: ServerRegistry
     private let launchPreferences: ProfileLaunchPreferences
-    private let contractProbe: APIv2Probe
-    private let v2: APIv2Client
+    private let restoredSessionValidator: RestoredSessionValidator
 
     enum SignOutAuthorization: Equatable, Sendable {
         case allowed(account: RefreshAccountIdentity?)
@@ -25,44 +24,12 @@ final class AuthService: @unchecked Sendable {
         serverIdentityResolver: ServerIdentityResolver = ServerIdentityResolver(),
         serverRegistry: ServerRegistry = .shared,
         launchPreferences: ProfileLaunchPreferences = .shared,
-        contractProbe: APIv2Probe = APIv2Probe(),
-        v2: APIv2Client = APIv2Client()
+        restoredSessionValidator: RestoredSessionValidator = .live
     ) {
         self.serverIdentityResolver = serverIdentityResolver
         self.serverRegistry = serverRegistry
         self.launchPreferences = launchPreferences
-        self.contractProbe = contractProbe
-        self.v2 = v2
-    }
-
-    /// Runs the v2 contract probe once for a server and returns the verdict
-    /// without recording it. Throws only for a v1-only server; any other
-    /// failure is left to the request that follows, which reports its own
-    /// connection error. Recording is separate so a setup candidate can be
-    /// probed without touching the active server's verdict.
-    private func probeContract(serverURL: String) async throws -> APIv2ProbeResult {
-        let result = await contractProbe.probe(serverURL: serverURL)
-        if case .updateServer = result {
-            throw APIv2Error.serverUpdateRequired
-        }
-        return result
-    }
-
-    /// Records a probe verdict for `serverId`. The monitor drops it unless
-    /// that server is the active one at record time, and, when `generation`
-    /// is given, unless it is still the latest probe issued for that server.
-    private func recordContract(
-        _ result: APIv2ProbeResult,
-        serverId: String,
-        generation: UInt64? = nil
-    ) async {
-        await MainActor.run {
-            if let generation {
-                ConnectionMonitor.shared.noteContractProbe(result, serverId: serverId, generation: generation)
-            } else {
-                ConnectionMonitor.shared.noteContractProbe(result, serverId: serverId)
-            }
-        }
+        self.restoredSessionValidator = restoredSessionValidator
     }
 
     // MARK: - Stored State Accessors
@@ -114,33 +81,11 @@ final class AuthService: @unchecked Sendable {
         let fetchedName = await serverIdentityResolver.fetchServerName(serverURL: normalized)
         try Task.checkCancellation()
 
-        // The contract probe runs once per connection. A v1-only candidate is
-        // rejected here, before anything is committed. Nothing is recorded
-        // for a candidate that is not the active server, so its verdict
-        // cannot touch the current session's state; when the caller is
-        // rechecking the server that IS active (e.g. "Check again" on the
-        // needs-setup screen), a v1-only answer must land so the pilot gate
-        // closes instead of letting v2 calls keep hitting an old server.
-        // The generation is issued before the await so a "Check again" that
-        // overlaps a foreground or recovery refresh cannot declare itself the
-        // newest result at completion and overwrite a newer verdict.
-        let generation = await MainActor.run {
-            ConnectionMonitor.shared.beginContractProbe(serverId: id)
-        }
-        let contractResult: APIv2ProbeResult
-        do {
-            contractResult = try await probeContract(serverURL: normalized)
-        } catch APIv2Error.serverUpdateRequired {
-            if serverRegistry.activeServerId == id {
-                await recordContract(.updateServer, serverId: id, generation: generation)
-            }
-            throw APIv2Error.serverUpdateRequired
-        }
-        try Task.checkCancellation()
-
         // Commit only after the candidate proves it can serve setup status.
-        let v2Status = try await v2.setupStatus(serverURL: normalized)
-        let status = SetupStatus(needsSetup: v2Status.needsSetup)
+        let status: SetupStatus = try await HTTPClient.shared.getUnauthenticated(
+            serverURL: normalized,
+            path: "/api/v1/auth/setup"
+        )
         try Task.checkCancellation()
 
         // Success: upsert the registry entry and make it active.
@@ -159,9 +104,6 @@ final class AuthService: @unchecked Sendable {
                 throw ServerRegistryError.persistenceFailed
             }
         }
-        // Now that the candidate is the active server, its verdict is the
-        // one the pilot gate should see.
-        await recordContract(contractResult, serverId: id, generation: generation)
 
         return status
     }
@@ -172,27 +114,21 @@ final class AuthService: @unchecked Sendable {
     func refreshActiveServerName() async {
         guard let server = serverRegistry.activeServer else { return }
         let serverId = server.id
-        // Refreshing the cached identity is the other moment the contract
-        // verdict is (re)established; the result only updates state here.
-        // The verdict is scoped to the server captured above, so a switch
-        // during the probe drops it instead of mislabelling the new server.
-        // Foreground return and unreachable->reachable recovery can both call
-        // this concurrently; the generation makes sure an older probe that
-        // finishes last cannot overwrite the newer verdict.
-        let generation = await MainActor.run {
-            ConnectionMonitor.shared.beginContractProbe(serverId: serverId)
-        }
-        await recordContract(
-            await contractProbe.probe(serverURL: server.url),
-            serverId: serverId,
-            generation: generation
-        )
-        guard serverRegistry.activeServerId == serverId else { return }
         guard let name = await serverIdentityResolver.fetchServerName(serverURL: server.url),
               serverRegistry.activeServerId == serverId else {
             return
         }
         serverRegistry.updateFetchedName(for: serverId, fetchedName: name)
+    }
+
+    /// Validate a Keychain-restored account without changing the remembered
+    /// server entry. Temporary failures return `indeterminate`; only the
+    /// existing HTTP refresh policy may invalidate a terminally rejected
+    /// credential while the account probe is in flight.
+    func validateRestoredSession(
+        expected: RefreshAccountIdentity
+    ) async -> RestoredSessionValidationResult {
+        await restoredSessionValidator.validate(expected: expected)
     }
 
     // MARK: - Authentication
@@ -201,22 +137,24 @@ final class AuthService: @unchecked Sendable {
         guard let expectedAccount = await TokenStore.shared.refreshAccountIdentity() else {
             throw HTTPError.serverUrlNotConfigured
         }
-        let response = try await APIv2Client().login(username: username, password: password, expectedAccount: expectedAccount)
+        let response: LoginResponse = try await HTTPClient.shared.post(
+            "/api/v1/auth/login",
+            body: LoginRequest(username: username, password: password)
+        )
         try await installSession(
             accessToken: response.accessToken,
             refreshToken: response.refreshToken,
-            accountID: response.user.id,
             expectedAccount: expectedAccount
         )
     }
 
-    /// A login response establishes a new durable session before credentials
-    /// are published. The checked installer clears the previous profile binding
-    /// within the same actor turn while request dispatch remains closed.
+    /// A login response establishes a brand-new session. Wipe every piece of
+    /// prior auth state before persisting the new tokens — no need to carry
+    /// `profileId` or `profileToken` across the boundary, and keeping them
+    /// just strands stale values that the server rejects.
     func installSession(
         accessToken: String,
         refreshToken: String,
-        accountID: String,
         expectedAccount: RefreshAccountIdentity
     ) async throws {
         guard let transitionLease = await HTTPClient.shared.beginIdentityTransition() else {
@@ -233,15 +171,14 @@ final class AuthService: @unchecked Sendable {
             if Task.isCancelled { throw CancellationError() }
             throw HTTPError.requestIdentityChanged
         }
-        do {
-            try await TokenStore.shared.installAccountSession(accessToken: accessToken, refreshToken: refreshToken, accountID: accountID, expectedAccount: expectedAccount)
-        } catch {
-            await HTTPClient.shared.endIdentityTransition(transitionLease)
-            throw error
-        }
         if let serverID = serverRegistry.activeServerId {
             launchPreferences.clearRememberedProfile(for: serverID)
         }
+        await TokenStore.shared.clearTokens()
+        await TokenStore.shared.saveTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken
+        )
         await clearAllCaches()
         await HTTPClient.shared.endIdentityTransition(transitionLease)
     }
@@ -641,14 +578,24 @@ final class AuthService: @unchecked Sendable {
 
     // MARK: - Device Login (QR sign-in)
 
-    func startDeviceLogin(deviceName: String, devicePlatform: String,
-                          expectedAccount: RefreshAccountIdentity) async throws -> DeviceLoginStartResponse {
-        try await APIv2Client().startDeviceLogin(DeviceLoginStartRequest(deviceName: deviceName, devicePlatform: devicePlatform),
-                                               expectedAccount: expectedAccount)
+    func startDeviceLogin(deviceName: String, devicePlatform: String) async throws -> DeviceLoginStartResponse {
+        try await HTTPClient.shared.post(
+            "/api/v1/auth/device/start",
+            body: DeviceLoginStartRequest(
+                deviceName: deviceName,
+                devicePlatform: devicePlatform
+            )
+        )
     }
 
-    func pollDeviceLogin(deviceCode: String, expectedAccount: RefreshAccountIdentity) async throws -> DeviceLoginPollResponse {
-        try await APIv2Client().pollDeviceLogin(deviceCode: deviceCode, expectedAccount: expectedAccount)
+    /// Poll the pairing row for status. Terminal statuses (approved /
+    /// denied / expired / consumed) return HTTP 200 with a status field;
+    /// a 404 means the row no longer exists (cleaned up post-expiry).
+    func pollDeviceLogin(deviceCode: String) async throws -> DeviceLoginPollResponse {
+        try await HTTPClient.shared.post(
+            "/api/v1/auth/device/poll",
+            body: DeviceLoginPollRequest(deviceCode: deviceCode)
+        )
     }
 
     // MARK: - Sign Out
@@ -683,7 +630,10 @@ final class AuthService: @unchecked Sendable {
         // regardless.
         if let signingOutAccount {
             do {
-                try await APIv2Client().logout(expectedAccount: signingOutAccount)
+                try await HTTPClient.shared.postVoid(
+                    "/api/v1/auth/logout",
+                    expectedAccount: signingOutAccount
+                )
             } catch {
                 // Swallow; the captured account check below still prevents
                 // clearing a server selected while logout was in flight.
@@ -712,19 +662,18 @@ final class AuthService: @unchecked Sendable {
             await HTTPClient.shared.endIdentityTransition(transitionLease)
             return false
         }
-        let durable: Bool
         if let signingOutServerId {
-            durable = await ServerRegistry.shared.signOut(
+            await ServerRegistry.shared.signOut(
                 serverId: signingOutServerId,
                 purgeCurrentBinding: false,
                 purgeRegistryBindings: false
             )
         } else {
-            durable = await TokenStore.shared.clearTokens()
+            await TokenStore.shared.clearTokens()
         }
         await clearAllCaches()
         await HTTPClient.shared.endIdentityTransition(transitionLease)
-        return durable
+        return true
     }
 
     /// Decide whether a captured credential can authorize local sign-out.

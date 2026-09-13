@@ -1490,7 +1490,7 @@ struct CreateCollectionRequest: Codable {
 
 // MARK: - User Info
 
-struct UserInfo: Codable {
+struct UserInfo: Codable, Sendable {
     let id: String?
     let username: String
     let isAdmin: Bool?
